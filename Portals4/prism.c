@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <limits.h>
 #include <portals4.h>
+#include <portals4_bxiext.h>
 #include <stdio.h>
 
 #include "uthash.h"
@@ -10,7 +11,7 @@
 #define PRISM_ERROR -1
 #define PRISM_SUCCESS 0
 
-//#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #define OPT_PERSISTENT_INFO(fmt, ...)                                  \
 	fprintf(stdout, "[OPT PERSISTENT INFO] %s:%d:%s(): " fmt "\n", \
@@ -251,8 +252,8 @@ int PRISM_Init(void) {
 
 	ret = PtlGetPhysId(ctx.ni_h, &my_phys_addr);
 	assert(ret == PTL_OK);
-	//printf("my_nid: %lu my_pid: %lu size: %lu\n", my_phys_addr.phys.nid,
-	 //      my_phys_addr.phys.pid, sizeof(my_phys_addr.phys.nid));
+	// printf("my_nid: %lu my_pid: %lu size: %lu\n", my_phys_addr.phys.nid,
+	//       my_phys_addr.phys.pid, sizeof(my_phys_addr.phys.nid));
 
 	ctx.peer_procs = malloc(ctx.n_peers * sizeof(ptl_process_t));
 
@@ -260,10 +261,10 @@ int PRISM_Init(void) {
 		       ctx.peer_procs, sizeof(ptl_process_t), MPI_BYTE,
 		       MPI_COMM_WORLD);
 
-	//if (my_rank == 0) {
+	// if (my_rank == 0) {
 	//	printf("other_nid: %lu other_pid: %lu\n",
 	//	       ctx.peer_procs[1].phys.nid, ctx.peer_procs[1].phys.pid);
-	//}
+	// }
 	OPT_PERSISTENT_INFO("Done initializing PRISM");
 	return PRISM_SUCCESS;
 }
@@ -314,7 +315,8 @@ static inline int mpiext_persistent_register_memory(
 	assert(event.type == PTL_EVENT_LINK);
 	assert(event.ni_fail_type == PTL_NI_OK);
 
-	unsigned md_options = PTL_MD_VOLATILE | PTL_MD_EVENT_CT_SEND;
+	unsigned md_options = PTL_MD_EVENT_SUCCESS_DISABLE | PTL_MD_EVENT_SEND_DISABLE | PTL_MD_VOLATILE |
+			      PTL_MD_EVENT_CT_SEND;
 
 	ptl_md_t md = {
 	    .start = NULL,
@@ -360,6 +362,25 @@ static int mpiext_persistent_init_request(persistent_request_t *request) {
 }
 
 PERSISTENT_ALWAYS_INLINE static inline int
+mpiext_persistent_start_data_transfer_triggered(persistent_request_t *request) {
+	size_t local_offset = (size_t)request->data_buffer;
+	size_t remote_offset = request->remote_data_addr;
+	request->expected_le_ops++;  // set threshold
+	int ret = PtlTriggeredPut(
+	    request->md_h, local_offset, request->size, PRISM_ACK_TYPE,
+	    ctx.peer_procs[request->peer_rank], request->peer_pt_idx, 0,
+	    remote_offset, NULL, 0, request->le_ct_h, request->expected_le_ops);
+	if (ret != PTL_OK) {
+		OPT_PERSISTENT_ERR("PtlTriggeredPut failed with %s",
+				   PtlToStr(ret, PTL_STR_ERROR));
+		return -1;
+	}
+
+	request->expected_md_ops++;  // set threshold for local completion
+	return PRISM_SUCCESS;
+}
+
+PERSISTENT_ALWAYS_INLINE static inline int
 mpiext_persistent_start_data_transfer(persistent_request_t *request) {
 	size_t local_offset = (size_t)request->data_buffer;
 	size_t remote_offset = request->remote_data_addr;
@@ -395,17 +416,18 @@ static inline int mpiext_persistent_start_send_core_no_sync(
 	return mpiext_persistent_start_data_transfer(request);
 }
 
+static inline int mpiext_persistent_start_send_core_triggered(
+    persistent_request_t *request) {
+	return mpiext_persistent_start_data_transfer_triggered(request);
+}
+
 static inline int mpiext_persistent_start_send_core(
     persistent_request_t *request) {
 	ptl_ct_event_t event;
 	request->expected_le_ops++;
-	OPT_PERSISTENT_INFO("Waiting on %lu flag buffer ops",
-			    request->expected_le_ops);
 	int ret = PtlCTWait(request->le_ct_h, request->expected_le_ops, &event);
 	assert(ret == PTL_OK);
 	assert(event.failure == 0);
-
-	OPT_PERSISTENT_INFO("Got %lu flag buffer ops", event.success);
 
 	return mpiext_persistent_start_data_transfer(request);
 }
@@ -429,6 +451,7 @@ static inline int mpiext_persistent_start_recv_core(
 	OPT_PERSISTENT_INFO("Start recv core");
 	request->flag_buffer = READY_TO_RECEIVE_FLAG;
 	return mpiext_persistent_start_flag_transfer(request);
+	 return 0;
 }
 
 static inline int mpiext_persistent_finalize_recv_core(
@@ -498,6 +521,8 @@ mpiext_persistent_finialize_init_first(persistent_request_t *request) {
 	if (request->op_type == PERSISTENT_SEND) {
 		OPT_PERSISTENT_INFO("ready send operation on %i",
 				    ctx.my_world_rank);
+		//return mpiext_persistent_start_send_core_no_sync(request);
+		//return mpiext_persistent_start_send_core_triggered(request);
 		return mpiext_persistent_start_send_core(request);
 	} else {
 		OPT_PERSISTENT_INFO("ready recv operation on %i",
@@ -585,6 +610,8 @@ static int mpiext_persistent_start_recv_internal_no_sync(
 static int mpiext_persistent_start_send_internal(
     persistent_request_t *request) {
 	if (PERSISTENT_LIKELY(request->init_state == READY))
+		//return mpiext_persistent_start_send_core_no_sync(request);
+		//return mpiext_persistent_start_send_core_triggered(request);
 		return mpiext_persistent_start_send_core(request);
 	else {
 		return mpiext_persistent_finialize_init_first(request);
@@ -690,7 +717,7 @@ int PRISM_Prequest_free(PRISM_Request *request) {
 	if (request == NULL) return PRISM_SUCCESS;
 
 	persistent_request_t *req = (persistent_request_t *)*request;
-	OPT_PERSISTENT_INFO("Delte request with id %u",req->id);
+	OPT_PERSISTENT_INFO("Delte request with id %u", req->id);
 
 	mpiext_persistent_remove_request_from_table(req->id);
 
