@@ -1,12 +1,12 @@
-#include "uthash.h"
 #include "prism.h"
 #include <assert.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
-#include <stdio.h>
 
 #define PRISM_ERROR -1
 #define PRISM_SUCCESS 0
@@ -31,132 +31,222 @@
 #define PERSISTENT_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 #define MPIEXT_PERSISTENT_ADDR_KEY     "OPT_PERSISTENT_ADDR"
-#define MPIEXT_PERSISTENT_MSG_ADDR_KEY "OPT_PERSISTENT_MSG_ADDR"
 #define PERSISTENT_ALWAYS_INLINE       __attribute__((always_inline))
 
 #define MPIEXT_PERSISTENT_DEFAULT_COMP 64
+#define DEFAULT_REQUEST_STORE_SIZE UINT32_C(512)
 
 typedef enum mpiext_persistent_request_init_state {
-    CHECK_FOR_REMOTE_INFO = 1,
-    READY
+	CHECK_FOR_REMOTE_INFO = 1,
+	READY
 } mpiext_persistent_request_init_state_t;
 
 typedef enum mpiext_persistent_op_type {
-    PERSISTENT_SEND = 1,
-    PERSISTENT_RECV,
-    OP_INVALID
+	PERSISTENT_SEND = 1,
+	PERSISTENT_RECV,
+	OP_INVALID
 } mpiext_persistent_op_type_t;
 
+typedef enum request_store_state {
+	REQ_ACTIVE = 1,
+	REQ_FREE
+} request_store_state_t;
+
 typedef struct mpiext_persistent_ctx {
-    struct fi_info *fi;
-    struct fid_fabric *fabric;
-    struct fid_domain *domain;
-    struct fid_cq *cq;
-    struct fid_cq *msg_cq;
-    struct fid_av *av;
-    struct fid_av *msg_av;
-    struct fid_ep *ep;
-    struct fid_ep *msg_ep;
-    fi_addr_t *peer_addr;
-    fi_addr_t *msg_peer_addr;
-    int n_peers;
-    int my_world_rank;
+	struct fi_info *fi;
+	struct fid_fabric *fabric;
+	struct fid_domain *domain;
+	struct fid_cq *cq;
+	struct fid_cq *msg_cq;
+	struct fid_av *av;
+	struct fid_av *msg_av;
+	struct fid_ep *ep;
+	struct fid_ep *msg_ep;
+	fi_addr_t *peer_addr;
+	fi_addr_t *msg_peer_addr;
+	uint64_t inject_size;
+	int n_peers;
+	int my_world_rank;
 } mpiext_persistent_ctx_t;
 
 typedef struct persistent_request {
-    uint64_t remote_data_addr;
-    uint64_t remote_flag_addr;
-    uint64_t remote_data_mkey;
-    uint64_t remote_flag_mkey;
-    struct fid_cntr * data_access_cntr;
-    struct fid_cntr * flag_access_cntr;
-    uint64_t posted_ops;
-    uint64_t completed_ops;
-    uint64_t completed_msg_send;
-    uint64_t expected_flag_ops;
-    size_t size;
-    size_t my_rdma_info_size;
-    struct fid_mr *data_buffer_mr;
-    struct fid_mr *flag_buffer_mr;
-    void *data_buffer;
-    void *my_rdma_info_buffer;
-    uint32_t id;
-    int flag_buffer;
-    int tag;
-    int peer_rank;
-    int done_flag;
-    int rtr_flag;
-    mpiext_persistent_request_init_state_t init_state;
-    mpiext_persistent_op_type_t op_type;
+	uint64_t remote_data_addr;
+	uint64_t remote_flag_addr;
+	uint64_t remote_data_mkey;
+	uint64_t remote_flag_mkey;
+	uint64_t posted_ops;
+	uint64_t completed_ops;
+	uint64_t expected_flag_ops;
+	size_t size;
+	size_t my_rdma_info_size;
+	struct fid_mr *data_buffer_mr;
+	struct fid_mr *flag_buffer_mr;
+        struct fid_cntr * data_access_cntr;
+	void *data_buffer;
+	void *my_rdma_info_buffer;
+	uint32_t remote_store_index;
+	int flag_buffer;
+	int tag;
+	int peer_rank;
+	int store_index;
+	MPI_Comm req_comm;
+	mpiext_persistent_request_init_state_t init_state;
+	mpiext_persistent_op_type_t op_type;
+	request_store_state_t req_state;
 } persistent_request_t;
 
-typedef struct request_entry {
-    uint32_t id;
-    persistent_request_t *request;
-    UT_hash_handle hh;
-} request_entry_t;
+typedef struct request_element {
+	uint32_t index;
+	struct request_element *next;
+} request_element_t;
 
 static mpiext_persistent_ctx_t ctx;
-static request_entry_t *request_table = NULL;
 
-PERSISTENT_ALWAYS_INLINE static inline uint32_t combine32(uint32_t a, uint32_t b)
-{
-    return a ^ (b + 0x9E3779B9u + (a << 6) + (a >> 2));
-}
+static persistent_request_t *request_store = NULL;
+static request_element_t *free_requests_head = NULL;
+static request_element_t *free_requests_tail = NULL;
+static request_element_t *request_element_mpool = NULL;
 
 PERSISTENT_ALWAYS_INLINE static inline void
-mpiext_persistent_cleanup_request_ressources(persistent_request_t *req)
-{
-    fi_close(&req->data_buffer_mr->fid);
-    fi_close(&req->flag_buffer_mr->fid);
-    free(req->my_rdma_info_buffer);
+mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
+	int ret = 0;
+	ret = fi_close(&req->data_buffer_mr->fid);
+	if(ret < 0)
+		OPT_PERSISTENT_ERR("data buffer close failed");
+	ret = fi_close(&req->flag_buffer_mr->fid);
+	if(ret < 0)
+		OPT_PERSISTENT_ERR("flag buffer close failed");
+        ret = fi_close(&req->data_access_cntr->fid);
+	if(ret < 0)
+		OPT_PERSISTENT_ERR("data cntr close failed");
+	free(req->my_rdma_info_buffer);
+
+	req->flag_access_cntr = NULL;
+	req->data_access_cntr = NULL;
+	req->data_buffer_mr = NULL;
+	req->flag_buffer_mr = NULL;
 }
 
-static inline void mpiext_persistent_clear_request_table(void)
-{
-    request_entry_t *current_request, *tmp;
-    HASH_ITER(hh, request_table, current_request, tmp)
-    {
-        assert(current_request != NULL);
-        mpiext_persistent_cleanup_request_ressources(current_request->request);
-        HASH_DEL(request_table, current_request);
-        free(current_request);
-    }
+static inline void free_requests_append(request_element_t *elem) {
+	if (free_requests_head == NULL) {
+		free_requests_head = elem;
+		free_requests_tail = elem;
+
+	} else {
+		free_requests_tail->next = elem;
+		free_requests_tail = elem;
+	}
 }
 
-static inline void mpiext_persistent_remove_request_from_table(uint32_t id)
-{
-    request_entry_t *entry = NULL;
+// forward declaration
+static inline void mpiext_persistent_reset_request(
+    persistent_request_t *request);
 
-    HASH_FIND(hh, request_table, &id, sizeof(uint32_t), entry);
-    assert(entry != NULL);
-    mpiext_persistent_cleanup_request_ressources(entry->request);
+static inline int init_request_storage(void) {
+	request_element_t *elem = NULL;
 
-    HASH_DEL(request_table, entry);
+	request_store =
+	    malloc(DEFAULT_REQUEST_STORE_SIZE * sizeof(persistent_request_t));
+	if (!request_store) {
+		OPT_PERSISTENT_ERR("request_store alloc failed");
+		return -1;
+	}
 
-    free(entry);
+	for (uint32_t i = 0; i < DEFAULT_REQUEST_STORE_SIZE; ++i) {
+		request_store[i].req_state = REQ_FREE;
+		request_store[i].store_index = i;
+		mpiext_persistent_reset_request(&request_store[i]);
+
+		elem = malloc(sizeof(request_element_t));
+
+		if (!elem) {
+			OPT_PERSISTENT_ERR("elem alloc failed");
+			return -1;
+		}
+
+		elem->index = i;
+		elem->next = NULL;
+
+		free_requests_append(elem);
+	}
+	return 0;
 }
 
-static void mpiext_persistent_add_request_to_table(uint32_t id, persistent_request_t *request)
-{
-    request_entry_t *entry = malloc(sizeof(request_entry_t));
-    assert(entry != NULL);
-    entry->id = id;
-    entry->request = request;
-    OPT_PERSISTENT_INFO("Adding %s request with key %u to table on rank %i",
-                        request->op_type == PERSISTENT_SEND ? "Send" : "Recv", id,
-                        ctx.my_world_rank);
+static inline void cleanup_request_storage(void) {
+	request_element_t *elem = free_requests_head;
 
-    HASH_ADD(hh, request_table, id, sizeof(uint32_t), entry);
+	while (elem != NULL) {
+		request_element_t *next = elem->next;
+		free(elem);
+		elem = next;
+	}
+
+	free_requests_head = NULL;
+	free_requests_tail = NULL;
+
+	elem = request_element_mpool;
+
+	while (elem != NULL) {
+		request_element_t *next = elem->next;
+		free(elem);
+		elem = next;
+	}
+
+	request_element_mpool = NULL;
+
+	for (uint32_t i = 0; i < DEFAULT_REQUEST_STORE_SIZE; ++i) {
+		if (request_store[i].req_state == REQ_FREE) continue;
+
+		mpiext_persistent_cleanup_request_ressources(&request_store[i]);
+	}
+
+	free(request_store);
+	request_store = NULL;
 }
 
-static PERSISTENT_ALWAYS_INLINE persistent_request_t *
-mpiext_persistent_get_request_from_table(uint32_t id)
-{
-    request_entry_t *entry = NULL;
-    OPT_PERSISTENT_INFO("Checking for id %u in table", id);
-    HASH_FIND(hh, request_table, &id, sizeof(uint32_t), entry);
-    return entry->request;
+static inline void request_element_mpool_put(request_element_t *elem) {
+	elem->index = -1;
+	elem->next = NULL;
+
+	if (request_element_mpool == NULL) {
+		request_element_mpool = elem;
+	} else {
+		// LIFO
+		elem->next = request_element_mpool;
+		request_element_mpool = elem;
+	}
+}
+
+static inline request_element_t *request_element_mpool_get(void) {
+	request_element_t *elem = request_element_mpool;
+	request_element_mpool = elem->next;
+	return elem;
+}
+
+static inline persistent_request_t *get_persistent_request(void) {
+	request_element_t *elem = free_requests_head;
+	free_requests_head = elem->next;
+	persistent_request_t *req = &request_store[elem->index];
+
+	req->req_state = REQ_ACTIVE;
+	req->store_index = elem->index;
+
+	request_element_mpool_put(elem);
+
+	return req;
+}
+
+static inline void put_persistent_request(int index) {
+	request_element_t *elem = request_element_mpool_get();
+
+	elem->index = index;
+
+	mpiext_persistent_cleanup_request_ressources(&request_store[index]);
+	mpiext_persistent_reset_request(&request_store[index]);
+
+	request_store[index].req_state = REQ_FREE;
+
+	free_requests_append(elem);
 }
 
 #ifdef DEBUG
@@ -189,31 +279,28 @@ static void mpiext_persistent_print_provider_info(struct fi_info *info)
     }
 }
 #endif
-
-static inline void mpiext_persistent_reset_request(persistent_request_t *request)
-{
-    request->posted_ops = 0;
-    request->completed_ops = 0;
-    request->completed_msg_send = 0;
-    request->expected_flag_ops = 0;
-    request->remote_data_addr = 0;
-    request->remote_flag_addr = 0;
-    request->remote_data_mkey = 0;
-    request->remote_flag_mkey = 0;
-    request->data_buffer_mr = NULL;
-    request->flag_buffer_mr = NULL;
-    request->size = 0;
-    request->id = 99;
-    request->my_rdma_info_size = 0;
-    request->data_buffer = NULL;
-    request->my_rdma_info_buffer = NULL;
-    request->flag_buffer = -1;
-    request->tag = -1;
-    request->peer_rank = -1;
-    request->done_flag = TRANSMISSION_COMPLETE_FLAG;
-    request->rtr_flag = READY_TO_RECEIVE_FLAG;
-    request->init_state = CHECK_FOR_REMOTE_INFO;
-    request->op_type = OP_INVALID;
+static inline void mpiext_persistent_reset_request(
+    persistent_request_t *request) {
+	request->posted_ops = 0;
+	request->completed_ops = 0;
+	request->expected_flag_ops = 0;
+	request->remote_data_addr = 0;
+	request->remote_flag_addr = 0;
+	request->remote_data_mkey = 0;
+	request->remote_flag_mkey = 0;
+	request->data_access_cntr = NULL;
+	request->data_buffer_mr = NULL;
+	request->flag_buffer_mr = NULL;
+	request->size = 0;
+	request->my_rdma_info_size = 0;
+	request->data_buffer = NULL;
+	request->my_rdma_info_buffer = NULL;
+	request->flag_buffer = -1;
+	request->tag = -1;
+	request->req_comm = MPI_COMM_NULL;
+	request->peer_rank = -1;
+	request->init_state = CHECK_FOR_REMOTE_INFO;
+	request->op_type = OP_INVALID;
 }
 
 int PRISM_Init(void)
@@ -225,6 +312,8 @@ int PRISM_Init(void)
     char addr[64];
     uint64_t addr_len = 64;
     int my_rank, world_size;
+    struct fi_info *rma_info;
+    struct fi_info *tagged_info;
     
     PMPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     PMPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -236,27 +325,28 @@ int PRISM_Init(void)
     assert(hints != NULL);
 
     hints->ep_attr->type = FI_EP_RDM;
-    hints->caps = FI_RMA | FI_TAGGED | FI_WRITE | FI_REMOTE_WRITE;
+    hints->caps = FI_RMA;
     hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
     hints->domain_attr->mr_mode = ~3;
     hints->domain_attr->threading = FI_THREAD_DOMAIN;
     hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
     hints->addr_format = FI_FORMAT_UNSPEC;
 
-    ret = fi_getinfo(FI_VERSION(2, 2), NULL, NULL, 0, hints, &ctx.fi);
+    ret = fi_getinfo(FI_VERSION(2, 2), NULL, NULL, 0, hints, &rma_info);
     assert(ret == 0);
+
     fi_freeinfo(hints);
 
 #ifdef DEBUG
     if (my_rank == 0) {
-        mpiext_persistent_print_provider_info(ctx.fi);
+        mpiext_persistent_print_provider_info(rma_info);
     }
 #endif
 
-    ret = fi_fabric(ctx.fi->fabric_attr, &ctx.fabric, NULL);
+    ret = fi_fabric(rma_info->fabric_attr, &ctx.fabric, NULL);
     assert(ret == 0);
 
-    ret = fi_domain(ctx.fabric, ctx.fi, &ctx.domain, NULL);
+    ret = fi_domain(ctx.fabric, rma_info, &ctx.domain, NULL);
     assert(ret == 0);
 
     cq_attr.format = FI_CQ_FORMAT_CONTEXT;
@@ -271,9 +361,9 @@ int PRISM_Init(void)
     ret = fi_av_open(ctx.domain, &av_attr, &ctx.av, NULL);
     assert(ret == 0);
 
-    ret = fi_endpoint(ctx.domain, ctx.fi, &ctx.ep, NULL);
+    ret = fi_endpoint(ctx.domain, rma_info, &ctx.ep, NULL);
     assert(ret == 0);
-    ret = fi_ep_bind(ctx.ep, &ctx.cq->fid, FI_TRANSMIT | FI_SELECTIVE_COMPLETION | FI_RECV);
+    ret = fi_ep_bind(ctx.ep, &ctx.cq->fid, FI_TRANSMIT | FI_SELECTIVE_COMPLETION);
     assert(ret == 0);
 
     ret = fi_ep_bind(ctx.ep, &ctx.av->fid, 0);
@@ -292,33 +382,8 @@ int PRISM_Init(void)
     OPT_PERSISTENT_INFO("My ep addr_len: %lu", addr_len);
 
     ctx.peer_addr = calloc(ctx.n_peers, sizeof(fi_addr_t));
-    ctx.msg_peer_addr = calloc(ctx.n_peers, sizeof(fi_addr_t));
-    assert(ctx.peer_addr != NULL);
-
-    memset(&cq_attr, 0, sizeof(cq_attr));
-    cq_attr.format = FI_CQ_FORMAT_TAGGED;
-    cq_attr.wait_obj = FI_WAIT_NONE;
-
-    ret = fi_cq_open(ctx.domain, &cq_attr, &ctx.msg_cq, NULL);
-    assert(ret == 0);
-
-    ret = fi_av_open(ctx.domain, &av_attr, &ctx.msg_av, NULL);
-    assert(ret == 0);
-
-    ret = fi_endpoint(ctx.domain, ctx.fi, &ctx.msg_ep, NULL);
-    assert(ret == 0);
-    ret = fi_ep_bind(ctx.msg_ep, &ctx.msg_cq->fid, FI_SEND | FI_RECV);
-    assert(ret == 0);
-
-    ret = fi_ep_bind(ctx.msg_ep, &ctx.msg_av->fid, 0);
-    assert(ret == 0);
-
-    /* Enable the endpoint: from this point data-path calls are valid. */
-    ret = fi_enable(ctx.msg_ep);
-    assert(ret == 0);
-
+  
     char *tmp_addr_buffer = malloc(world_size * addr_len);
-    char *tmp_msg_addr_buffer = malloc(world_size * addr_len);
 
     PMPI_Allgather(addr,addr_len,MPI_BYTE,tmp_addr_buffer,addr_len,MPI_BYTE,MPI_COMM_WORLD);
 
@@ -330,27 +395,10 @@ int PRISM_Init(void)
 		OPT_PERSISTENT_ERR("fi_av_insert failed");
 	}
     }
+   
+    ctx.inject_size = rma_info->tx_attr->inject_size;
 
-    OPT_PERSISTENT_INFO("My msg_ep addr: %lu", (uint64_t) addr);
-    OPT_PERSISTENT_INFO("My msg_ep addr_len: %lu", addr_len);
-
-   /* Publish our ep address */
-    memset(&addr[0], 0, 64);
-    ret = fi_getname(&ctx.msg_ep->fid, &addr[0], &addr_len);
-    assert(ret == 0);
-
-    PMPI_Allgather(addr,addr_len,MPI_BYTE,tmp_msg_addr_buffer,addr_len,MPI_BYTE,MPI_COMM_WORLD);
-
-    for(int i = 0; i < world_size; ++i){
-	if(i == my_rank)
-		continue;
-	ret = fi_av_insert(ctx.msg_av,tmp_msg_addr_buffer + i * addr_len, 1, &ctx.msg_peer_addr[i],0,NULL);
-	if(ret < 0){
-		OPT_PERSISTENT_ERR("fi_av_insert failed");
-	}
-    }
-
-    assert(ctx.msg_peer_addr != NULL);
+    init_request_storage();
     OPT_PERSISTENT_INFO("Done initializing PRISM");
     return PRISM_SUCCESS;
 }
@@ -372,8 +420,10 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
     ret = fi_mr_bind(request->data_buffer_mr, &ctx.ep->fid, 0ULL);
     assert(ret == 0);
 
-    ret = fi_cntr_open(ctx.domain,&attr,&request->data_access_cntr,NULL);
-    assert(ret == 0);
+    ret = fi_cntr_open(ctx.domain, &attr,&request->data_access_cntr,NULL);
+    if(ret < 0){
+	OPT_PERSISTENT_ERR("cntr open failed with %i %s",ret, fi_strerror(-ret));
+    }
 
     ret = fi_mr_bind(request->data_buffer_mr, &request->data_access_cntr->fid, FI_REMOTE_WRITE);
     assert(ret == 0);
@@ -393,12 +443,6 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
     ret = fi_mr_bind(request->flag_buffer_mr, &ctx.ep->fid, 0ULL);
     assert(ret == 0);
 
-    ret = fi_cntr_open(ctx.domain,&attr,&request->flag_access_cntr,NULL);
-    assert(ret == 0);
-
-    ret = fi_mr_bind(request->flag_buffer_mr, &request->flag_access_cntr->fid, FI_REMOTE_WRITE);
-    assert(ret == 0);
-
     ret = fi_mr_enable(request->flag_buffer_mr);
     assert(ret == 0);
 
@@ -414,25 +458,23 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
 PERSISTENT_ALWAYS_INLINE static inline void
 mpiext_persistent_pack_rdma_info(persistent_request_t *request)
 {
-
     uint64_t *packed = request->my_rdma_info_buffer;
     packed[0] = (uint64_t) request->data_buffer;
     packed[1] = fi_mr_key(request->data_buffer_mr);
     packed[2] = (uint64_t) &request->flag_buffer;
     packed[3] = fi_mr_key(request->flag_buffer_mr);
+    packed[4] = (uint64_t)request->store_index;
 }
 
 PERSISTENT_ALWAYS_INLINE static inline void
 mpiext_persistent_unpack_rdma_info(persistent_request_t *request, void *payload)
 {
-	OPT_PERSISTENT_INFO("Unpacking req from peer: %i",request->peer_rank);
-if(!payload)
-OPT_PERSISTENT_INFO("Invalid payload");
     uint64_t *packed = payload;
     request->remote_data_addr = packed[0];
     request->remote_data_mkey = packed[1];
     request->remote_flag_addr = packed[2];
     request->remote_flag_mkey = packed[3];
+    request->store_index = (uint32_t)packed[4];
 }
 
 static void mpiext_persistent_cleanup_module(void)
@@ -443,63 +485,24 @@ static void mpiext_persistent_cleanup_module(void)
         fi_close(&ctx.cq->fid);
     if (ctx.ep)
         fi_close(&ctx.ep->fid);
-    if (ctx.msg_av)
-        fi_close(&ctx.msg_av->fid);
-    if (ctx.msg_cq)
-        fi_close(&ctx.msg_cq->fid);
-    // if (ctx.msg_ep)
-    //    fi_close(&ctx.msg_ep->fid);
     if (ctx.domain)
         fi_close(&ctx.domain->fid);
     if (ctx.fabric)
         fi_close(&ctx.fabric->fid);
-    if (ctx.fi)
-        fi_freeinfo(ctx.fi);
 }
 
 int PRISM_Finalize(void)
 {
-    mpiext_persistent_clear_request_table();
+    cleanup_request_storage();
     mpiext_persistent_cleanup_module();
     return PRISM_SUCCESS;
-}
-
-PERSISTENT_ALWAYS_INLINE static inline int mpiext_persistent_msg_progress(void)
-{
-    struct fi_cq_tagged_entry cqes[MPIEXT_PERSISTENT_DEFAULT_COMP];
-    struct fi_cq_err_entry err;
-    persistent_request_t *request = NULL;
-    ssize_t rc;
-
-    rc = fi_cq_read(ctx.msg_cq, cqes, MPIEXT_PERSISTENT_DEFAULT_COMP);
-
-    if (rc > 0) {
-        for (ssize_t i = 0; i < rc; ++i) {
-            if (cqes[i].flags & FI_RECV) {
-            request = cqes[i].op_context;
-                mpiext_persistent_unpack_rdma_info(request, request->my_rdma_info_buffer);
-                request->init_state = READY;
-            } else if (cqes[i].flags & FI_SEND) {
-            request = cqes[i].op_context;
-                request->completed_msg_send++;
-            }
-        }
-    }
-
-    if (PERSISTENT_UNLIKELY(rc == -FI_EAVAIL)) {
-        fi_cq_readerr(ctx.cq, &err, 0);
-        OPT_PERSISTENT_ERR("CQ: %s", fi_cq_strerror(ctx.cq, err.prov_errno, err.err_data, NULL, 0));
-        return rc;
-    }
-
-    return 0;
 }
 
 static int mpiext_persistent_init_request(persistent_request_t *request)
 {
     int ret = 0;
     mpiext_persistent_register_memory(request);
-    request->my_rdma_info_size = 4 * sizeof(uint64_t);
+    request->my_rdma_info_size = 5 * sizeof(uint64_t);
 
     request->my_rdma_info_buffer = malloc(request->my_rdma_info_size);
     assert(request->my_rdma_info_buffer != NULL);
@@ -507,30 +510,14 @@ static int mpiext_persistent_init_request(persistent_request_t *request)
     mpiext_persistent_pack_rdma_info(request);
 
     // We assume eager protocol usage here
-    // PMPI_Send(request->my_rdma_info_buffer, request->my_rdma_info_size, MPI_BYTE,
-    //          request->peer_rank, request->tag, MPI_COMM_WORLD);
-OPT_PERSISTENT_INFO("fi_tsend");
-    do {
-        ret = fi_tsend(ctx.msg_ep, request->my_rdma_info_buffer, request->my_rdma_info_size, NULL,
-                       ctx.msg_peer_addr[request->peer_rank], request->id, request);
-        if (ret == -FI_EAGAIN) {
-            mpiext_persistent_msg_progress();
-        } else if (ret < 0 && ret != FI_EAGAIN) {
-            OPT_PERSISTENT_ERR("fi_tsend failed with %s", fi_strerror(-ret));
-            return ret;
-        }
-    } while (ret);
-
-    // Block until send completion
-    while (request->completed_msg_send != 1) {
-        mpiext_persistent_msg_progress();
-    }
-
+    PMPI_Send(request->my_rdma_info_buffer, request->my_rdma_info_size, MPI_BYTE,
+              request->peer_rank, request->tag, MPI_COMM_WORLD);
+    
     return PRISM_SUCCESS;
 }
 
 PERSISTENT_ALWAYS_INLINE static inline int
-mpiext_persistent_progress(int count, struct fi_cq_data_entry cqes[])
+mpiext_persistent_progress(int count, struct fi_cq_entry cqes[])
 {
     struct fi_cq_err_entry err;
     persistent_request_t *request = NULL;
@@ -540,11 +527,8 @@ mpiext_persistent_progress(int count, struct fi_cq_data_entry cqes[])
 
     if (rc > 0) {
         for (ssize_t i = 0; i < rc; ++i) {
-            if (cqes[i].flags & FI_WRITE) {
-OPT_PERSISTENT_INFO("finised loacal write");
                 request = cqes[i].op_context;
                 request->completed_ops++;
-            }
         }
     }
 
@@ -589,10 +573,10 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request)
 
     flags = 0;
 
-    if (request->size <= ctx.fi->tx_attr->inject_size) {
-        flags |= FI_INJECT;
+    if (request->size <= ctx.inject_size) {
+        flags = FI_INJECT;
     } else {
-        flags |= FI_COMPLETION | FI_INJECT_COMPLETE;
+        flags = FI_COMPLETION | FI_INJECT_COMPLETE;
         request->posted_ops++;
     }
 
@@ -637,19 +621,16 @@ static inline int mpiext_persistent_start_send_core_no_sync(persistent_request_t
 
 static inline int mpiext_persistent_start_send_core(persistent_request_t *request)
 {
-	request->expected_flag_ops++;
-	uint64_t cur;
-	for(;;){
-		cur = fi_cntr_read(request->flag_access_cntr);
-		if(cur == request->expected_flag_ops)
-			break;
+	volatile int *flag = &request->flag_buffer;
+	while(*flag != READY_TO_RECEIVE_FLAG){
+		(void)fi_cq_read(ctx.cq,NULL,0);
 	}
     return mpiext_persistent_start_data_transfer(request);
 }
 
 static inline int mpiext_persistent_finalize_send_core(persistent_request_t *request)
 {
-    struct fi_cq_data_entry cqe[MPIEXT_PERSISTENT_DEFAULT_COMP];
+    struct fi_cq_entry cqe[MPIEXT_PERSISTENT_DEFAULT_COMP];
 
     while (request->posted_ops != request->completed_ops) {
         mpiext_persistent_progress(MPIEXT_PERSISTENT_DEFAULT_COMP, cqe);
@@ -667,7 +648,7 @@ static inline int mpiext_persistent_start_recv_core_no_sync(persistent_request_t
 
 static inline int mpiext_persistent_start_recv_core(persistent_request_t *request)
 {
-OPT_PERSISTENT_INFO("Start recv core");
+    OPT_PERSISTENT_INFO("Start recv core");
     request->flag_buffer = READY_TO_RECEIVE_FLAG;
     request->posted_ops++;
     return mpiext_persistent_start_flag_transfer(request);
@@ -675,12 +656,9 @@ OPT_PERSISTENT_INFO("Start recv core");
 
 static inline int mpiext_persistent_finalize_recv_core(persistent_request_t *request)
 {
-    uint64_t cur;
-    for(;;){
-		cur = fi_cntr_read(request->data_access_cntr);
-		if(cur == request->posted_ops)
-			break;	
-    }
+    int ret = fi_cntr_wait(request->data_access_cntr,request->posted_ops,-1);
+    if(ret < 0)
+	OPT_PERSISTENT_ERR("fi_cntr_wait failed\n");
     OPT_PERSISTENT_INFO("Finalized Recv operation");
     return PRISM_SUCCESS;
 }
@@ -693,27 +671,14 @@ OPT_PERSISTENT_INFO("req: %p peer_rank: %i",request,request->peer_rank);
     void *payload = malloc(request->my_rdma_info_size);
     assert(payload != NULL);
 
+    PMPI_Recv(payload, request->my_rdma_info_size, MPI_BYTE, request->peer_rank, request->tag,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    // PMPI_Recv(payload, request->my_rdma_info_size, MPI_BYTE, request->peer_rank, request->tag,
-    //           MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    // mpiext_persistent_unpack_rdma_info(request, payload);
-    do {
-        ret = fi_trecv(ctx.msg_ep, payload, request->my_rdma_info_size, NULL,
-                       ctx.msg_peer_addr[request->peer_rank], request->id, 0, request);
-        if (ret == -FI_EAGAIN) {
-            mpiext_persistent_msg_progress();
-        } else if (ret < 0 && ret != FI_EAGAIN) {
-            OPT_PERSISTENT_ERR("fi_tsend failed with %s", fi_strerror(-ret));
-            return ret;
-        }
-    } while (ret);
+    mpiext_persistent_unpack_rdma_info(request, payload);
 
-    while (request->init_state != READY) {
-        mpiext_persistent_msg_progress();
-    }
+    free(payload);
 
-    // important: set ready state here
-    assert(request->init_state == READY);
+    request->init_state = READY;
 
     // Start operation after we finished init
     if (request->op_type == PERSISTENT_SEND) {
@@ -732,31 +697,13 @@ mpiext_persistent_finialize_init_first(persistent_request_t *request)
     void *payload = malloc(request->my_rdma_info_size);
     assert(payload != NULL);
 
-    OPT_PERSISTENT_INFO("Posting init recv");
-    // PMPI_Recv(payload, request->my_rdma_info_size, MPI_BYTE, request->peer_rank, request->tag,
-    //           MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    // mpiext_persistent_unpack_rdma_info(request, payload);
-    memset(request->my_rdma_info_buffer,0,request->my_rdma_info_size);
-    do {
-        ret = fi_trecv(ctx.msg_ep, request->my_rdma_info_buffer, request->my_rdma_info_size, NULL,
-                       ctx.msg_peer_addr[request->peer_rank], request->id, 0, request);
-        if (ret == -FI_EAGAIN) {
-            mpiext_persistent_msg_progress();
-        } else if (ret < 0 && ret != FI_EAGAIN) {
-            OPT_PERSISTENT_ERR("fi_tsend failed with %s", fi_strerror(-ret));
-            return ret;
-        }
-    } while (ret);
-
-    OPT_PERSISTENT_INFO("Now progressing");
-    while (request->init_state != READY) {
-        mpiext_persistent_msg_progress();
-    }
+    PMPI_Recv(payload, request->my_rdma_info_size, MPI_BYTE, request->peer_rank, request->tag,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    mpiext_persistent_unpack_rdma_info(request, payload);
 
     free(payload);
 
-    // important: check ready state here
-    assert(request->init_state == READY);
+    request->init_state = READY;
 
     // Start operation after we finished init
     if (request->op_type == PERSISTENT_SEND) {
@@ -768,61 +715,52 @@ mpiext_persistent_finialize_init_first(persistent_request_t *request)
     }
 }
 
-int PRISM_Psend_init(const void *buffer, int count, MPI_Datatype datatype, int dst, int tag,
-                    MPI_Comm communicator, PRISM_Request *request)
-{
-    int size;
-    OPT_PERSISTENT_INFO("Called PSend_init");
-    persistent_request_t *req = malloc(sizeof(persistent_request_t));
+int PRISM_Psend_init(const void *buffer, int count, MPI_Datatype datatype,
+		     int dst, int tag, MPI_Comm communicator,
+		     PRISM_Request *request) {
+	int size;
+	assert(buffer != NULL);
+	persistent_request_t *req = get_persistent_request();
 
-    assert(req != NULL);
+	assert(req != NULL);
 
-    OPT_PERSISTENT_INFO("[PSEND_INIT]: data buffer %p", (void *) buffer);
-    mpiext_persistent_reset_request(req);
+	req->req_comm = communicator;
+	req->tag = tag;
+	req->peer_rank = dst;
+	req->data_buffer = buffer;
+	req->op_type = PERSISTENT_SEND;
 
-    // check if av entry already exists
-    req->id = combine32((uint32_t) tag, (uint32_t) ctx.my_world_rank);
-    req->tag = tag;
-    req->peer_rank = dst;
-    req->data_buffer = buffer;
-    req->op_type = PERSISTENT_SEND;
+	PMPI_Type_size(datatype, &size);
+	req->size = size * count;
 
-    PMPI_Type_size(datatype, &size);
-    req->size = size * count;
 
-    mpiext_persistent_add_request_to_table(req->id, req);
-
-    *request = (void *) req;
-    OPT_PERSISTENT_INFO("[PSEND_INIT]: data buffer %p request: %p", (void *) buffer,req);
-    return mpiext_persistent_init_request(req);
+	*request = (void *)req;
+	OPT_PERSISTENT_INFO("[PSEND_INIT]: data buffer %p", (void *)buffer);
+	return mpiext_persistent_init_request(req);
 }
 
-int PRISM_Precv_init(void *buffer, int count, MPI_Datatype datatype, int src, int tag,
-                    MPI_Comm communicator, PRISM_Request *request)
-{
-    int size;
-    OPT_PERSISTENT_INFO("Called Precv_init");
-    persistent_request_t *req = malloc(sizeof(persistent_request_t));
+int PRISM_Precv_init(void *buffer, int count, MPI_Datatype datatype, int src,
+		     int tag, MPI_Comm communicator, PRISM_Request *request) {
+	int size;
+	assert(buffer != NULL);
+	persistent_request_t *req = get_persistent_request();
 
-    assert(req != NULL);
+	assert(req != NULL);
 
-    mpiext_persistent_reset_request(req);
 
-    // check if av entry already exists
-    req->id = combine32((uint32_t) tag, (uint32_t) src);
-    req->tag = tag;
-    req->peer_rank = src;
-    req->data_buffer = buffer;
-    req->op_type = PERSISTENT_RECV;
+	req->req_comm = communicator;
+	req->tag = tag;
+	req->peer_rank = src;
+	req->data_buffer = buffer;
+	req->op_type = PERSISTENT_RECV;
 
-    PMPI_Type_size(datatype, &size);
-    req->size = size * count;
+	PMPI_Type_size(datatype, &size);
+	req->size = size * count;
 
-    mpiext_persistent_add_request_to_table(req->id, req);
 
-    *request = (void *) req;
-    OPT_PERSISTENT_INFO("[PRECV_INIT]: data buffer %p request: %p", (void *) buffer,req);
-    return mpiext_persistent_init_request(req);
+	*request = (void *)req;
+	OPT_PERSISTENT_INFO("[PRECV_INIT]: data buffer %p", (void *)buffer);
+	return mpiext_persistent_init_request(req);
 }
 
 static int mpiext_persistent_start_send_internal_no_sync(persistent_request_t *request)
@@ -863,13 +801,10 @@ static int mpiext_persistent_start_recv_internal(persistent_request_t *request)
 
 static int mpiext_persistent_start_internal(persistent_request_t *request)
 {
-OPT_PERSISTENT_INFO("Checking op type");
     if (request->op_type == PERSISTENT_SEND){
-OPT_PERSISTENT_INFO("op type send");
         return mpiext_persistent_start_send_internal(request);
 }
     else{
-	OPT_PERSISTENT_INFO("op type recv");
         return mpiext_persistent_start_recv_internal(request);
 }
 }
@@ -903,9 +838,7 @@ int PRISM_Startall_no_sync(int count, PRISM_Request request_array[])
 
 int PRISM_Start(PRISM_Request *request)
 {
-	OPT_PERSISTENT_INFO("start req: %p",(void*)*request);
 	persistent_request_t *req = *request;
-	OPT_PERSISTENT_INFO("start req peer %i",req->peer_rank);
     return mpiext_persistent_start_internal(req);
 }
 
@@ -935,7 +868,7 @@ static int mpiext_persistent_wait_internal(persistent_request_t *request)
 
 int PRISM_Wait(PRISM_Request *request, MPI_Status *status)
 {
-    return mpiext_persistent_wait_internal((persistent_request_t *) *request);
+    return mpiext_persistent_wait_internal(*request);
 }
 
 int PRISM_Waitall(int count, PRISM_Request request_array[], MPI_Status status_array[])
@@ -945,7 +878,8 @@ int PRISM_Waitall(int count, PRISM_Request request_array[], MPI_Status status_ar
     for (int i = 0; i < count; i++) {
         if (!request_array[i])
             continue;
-        ret = mpiext_persistent_wait_internal((persistent_request_t *) *(request_array + i));
+	persistent_request_t *req = *(&request_array[i]);
+        ret = mpiext_persistent_wait_internal(req);
         if (PERSISTENT_UNLIKELY(PRISM_SUCCESS != ret)) {
             return PRISM_ERROR;
         }
@@ -953,17 +887,12 @@ int PRISM_Waitall(int count, PRISM_Request request_array[], MPI_Status status_ar
     return PRISM_SUCCESS;
 }
 
-int PRISM_Prequest_free(PRISM_Request *request)
-{
-    if (request == NULL)
-        return PRISM_SUCCESS;
+int PRISM_Prequest_free(PRISM_Request *request) {
+	if (request == NULL) return PRISM_SUCCESS;
 
-    persistent_request_t *req = (persistent_request_t *) *request;
+	persistent_request_t *req = (persistent_request_t *)*request;
+	put_persistent_request(req->store_index);
+	*request = PRISM_REQUEST_NULL;
 
-    mpiext_persistent_remove_request_from_table(req->id);
-
-    free(*request);
-    *request = NULL;
-
-    return PRISM_SUCCESS;
+	return PRISM_SUCCESS;
 }
