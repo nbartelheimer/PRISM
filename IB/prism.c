@@ -13,7 +13,7 @@
 #define PRISM_ERROR -1
 #define PRISM_SUCCESS 0
 
-#define DEBUG
+//#define DEBUG
 #ifdef DEBUG
 #define OPT_PERSISTENT_INFO(fmt, ...)                                  \
 	fprintf(stdout, "[OPT PERSISTENT INFO] %s:%d:%s(): " fmt "\n", \
@@ -580,8 +580,8 @@ mpiext_persistent_start_flag_transfer(persistent_request_t *request) {
 		    ctx.peer_addr[request->peer_rank],
 		    request->remote_flag_addr, request->remote_flag_mkey);
 		if (ret == -FI_EAGAIN) {
-			// mpiext_persistent_progress(MPIEXT_PERSISTENT_DEFAULT_COMP,
-			// cqe);
+			 //mpiext_persistent_progress(MPIEXT_PERSISTENT_DEFAULT_COMP,
+			 //cqe);
 			(void)fi_cq_read(ctx.cq, NULL, 0);
 		} else if (ret < 0) {
 			OPT_PERSISTENT_ERR("fi_writemsg data failed with %s",
@@ -602,15 +602,15 @@ static inline int mpiext_persistent_start_send_core(
     persistent_request_t *request) {
 	struct fi_cq_data_entry cqe[MPIEXT_PERSISTENT_DEFAULT_COMP];
 	volatile int *flag = &request->flag_buffer;
-	OPT_PERSISTENT_INFO("Waiting for RTR flag on %i from %i",
-			    ctx.my_world_rank, request->peer_rank);
+	OPT_PERSISTENT_INFO("Waiting for RTR flag on %i from %i on addr %p\n",
+			    ctx.my_world_rank, request->peer_rank, &request->flag_buffer);
 	while (*flag != READY_TO_RECEIVE_FLAG) {
 		// mpiext_persistent_progress(MPIEXT_PERSISTENT_DEFAULT_COMP,
 		// cqe);
 		(void)fi_cq_read(ctx.cq, NULL, 0);
 	}
 	request->flag_buffer = 0;
-	OPT_PERSISTENT_INFO("Got RTR flag");
+	OPT_PERSISTENT_INFO("Got RTR flag\n");
 
 	return mpiext_persistent_start_data_transfer(request);
 }
@@ -637,8 +637,8 @@ static inline int mpiext_persistent_start_recv_core(
     persistent_request_t *request) {
 	request->flag_buffer = READY_TO_RECEIVE_FLAG;
 	request->posted_ops++;
-	OPT_PERSISTENT_INFO("Sending RTR flag to %i from %i",
-			    request->peer_rank, ctx.my_world_rank);
+	OPT_PERSISTENT_INFO("Sending RTR flag to %i from %i to addr 0x%lx\n",
+			    request->peer_rank, ctx.my_world_rank, request->remote_flag_addr);
 	return mpiext_persistent_start_flag_transfer(request);
 }
 
@@ -674,7 +674,7 @@ mpiext_persistent_finialize_init_first_no_sync(persistent_request_t *request) {
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_send_core_no_sync(request);
 	} else {
-		OPT_PERSISTENT_INFO("ready recv operation on %i",
+		OPT_PERSISTENT_INFO("ready recv operation on %i\n",
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_recv_core_no_sync(request);
 	}
@@ -702,7 +702,7 @@ mpiext_persistent_finialize_init_first(persistent_request_t *request) {
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_send_core(request);
 	} else {
-		OPT_PERSISTENT_INFO("ready recv operation on %i",
+		printf("ready recv operation on %i\n",
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_recv_core(request);
 	}
@@ -712,15 +712,13 @@ int PRISM_Psend_init(const void *buffer, int count, MPI_Datatype datatype,
 		     int dst, int tag, MPI_Comm communicator,
 		     PRISM_Request *request) {
 	int size;
-	// persistent_request_t *req = malloc(sizeof(persistent_request_t));
+
 	assert(buffer != NULL);
+
 	persistent_request_t *req = get_persistent_request();
 
 	assert(req != NULL);
 
-	// mpiext_persistent_reset_request(req);
-
-	// check if av entry already exists
 	req->req_comm = communicator;
 	req->tag = tag;
 	req->peer_rank = dst;
@@ -729,8 +727,6 @@ int PRISM_Psend_init(const void *buffer, int count, MPI_Datatype datatype,
 
 	PMPI_Type_size(datatype, &size);
 	req->size = size * count;
-
-	// mpiext_persistent_add_request_to_table(req->id, req);
 
 	*request = (void *)req;
 	OPT_PERSISTENT_INFO("[PSEND_INIT]: data buffer %p", (void *)buffer);
@@ -741,14 +737,11 @@ int PRISM_Precv_init(void *buffer, int count, MPI_Datatype datatype, int src,
 		     int tag, MPI_Comm communicator, PRISM_Request *request) {
 	int size;
 	assert(buffer != NULL);
-	// persistent_request_t *req = malloc(sizeof(persistent_request_t));
+
 	persistent_request_t *req = get_persistent_request();
 
 	assert(req != NULL);
 
-	// mpiext_persistent_reset_request(req);
-
-	// check if av entry already exists
 	req->req_comm = communicator;
 	req->tag = tag;
 	req->peer_rank = src;
@@ -757,8 +750,6 @@ int PRISM_Precv_init(void *buffer, int count, MPI_Datatype datatype, int src,
 
 	PMPI_Type_size(datatype, &size);
 	req->size = size * count;
-
-	// mpiext_persistent_add_request_to_table(req->id, req);
 
 	*request = (void *)req;
 	OPT_PERSISTENT_INFO("[PRECV_INIT]: data buffer %p", (void *)buffer);
@@ -886,7 +877,6 @@ int PRISM_Prequest_free(PRISM_Request *request) {
 
 	persistent_request_t *req = (persistent_request_t *)*request;
 
-	// mpiext_persistent_remove_request_from_table(req->id);
 	put_persistent_request(req->store_index);
 
 	*request = NULL;
