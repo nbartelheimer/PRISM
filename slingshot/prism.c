@@ -121,7 +121,6 @@ mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
 		OPT_PERSISTENT_ERR("data cntr close failed");
 	free(req->my_rdma_info_buffer);
 
-	req->flag_access_cntr = NULL;
 	req->data_access_cntr = NULL;
 	req->data_buffer_mr = NULL;
 	req->flag_buffer_mr = NULL;
@@ -332,7 +331,7 @@ int PRISM_Init(void)
     hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
     hints->addr_format = FI_FORMAT_UNSPEC;
 
-    ret = fi_getinfo(FI_VERSION(2, 2), NULL, NULL, 0, hints, &rma_info);
+    ret = fi_getinfo(FI_VERSION(2, 3), NULL, NULL, 0, hints, &rma_info);
     assert(ret == 0);
 
     fi_freeinfo(hints);
