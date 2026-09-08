@@ -271,7 +271,6 @@ static inline void mpiext_persistent_reset_request(
     persistent_request_t *request) {
 	request->posted_ops = 0;
 	request->completed_ops = 0;
-	request->completed_msg_send = 0;
 	request->remote_data_addr = 0;
 	request->remote_flag_addr = 0;
 	request->remote_data_mkey = 0;
