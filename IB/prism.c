@@ -60,13 +60,9 @@ typedef struct mpiext_persistent_ctx {
 	struct fid_fabric *fabric;
 	struct fid_domain *domain;
 	struct fid_cq *cq;
-	struct fid_cq *msg_cq;
 	struct fid_av *av;
-	struct fid_av *msg_av;
 	struct fid_ep *ep;
-	struct fid_ep *msg_ep;
 	fi_addr_t *peer_addr;
-	fi_addr_t *msg_peer_addr;
 	int n_peers;
 	int my_world_rank;
 } mpiext_persistent_ctx_t;
@@ -78,7 +74,6 @@ typedef struct persistent_request {
 	uint64_t remote_flag_mkey;
 	uint64_t posted_ops;
 	uint64_t completed_ops;
-	uint64_t completed_msg_send;
 	size_t size;
 	size_t my_rdma_info_size;
 	struct fid_mr *data_buffer_mr;
