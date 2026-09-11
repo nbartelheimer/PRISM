@@ -248,7 +248,6 @@ static inline void put_persistent_request(int index) {
 	free_requests_append(elem);
 }
 
-#ifdef DEBUG
 static void mpiext_persistent_print_provider_info(struct fi_info *info)
 {
     if (NULL != info) {
@@ -277,7 +276,7 @@ static void mpiext_persistent_print_provider_info(struct fi_info *info)
         fprintf(stderr, "  tx rma_iov_limit: %ld\n", tx_attr->rma_iov_limit);
     }
 }
-#endif
+
 static inline void mpiext_persistent_reset_request(
     persistent_request_t *request) {
 	request->posted_ops = 0;
@@ -324,9 +323,9 @@ int PRISM_Init(void)
     assert(hints != NULL);
 
     hints->ep_attr->type = FI_EP_RDM;
-    hints->caps = FI_RMA;
-    hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
-    hints->domain_attr->mr_mode = ~3;
+    hints->caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_RMA_EVENT;
+    //hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
+    hints->domain_attr->mr_mode = FI_MR_ALLOCATED | FI_MR_ENDPOINT;
     hints->domain_attr->threading = FI_THREAD_DOMAIN;
     hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
     hints->addr_format = FI_FORMAT_UNSPEC;
@@ -336,11 +335,11 @@ int PRISM_Init(void)
 
     fi_freeinfo(hints);
 
-#ifdef DEBUG
+//#ifdef DEBUG
     if (my_rank == 0) {
         mpiext_persistent_print_provider_info(rma_info);
     }
-#endif
+//#endif
 
     ret = fi_fabric(rma_info->fabric_attr, &ctx.fabric, NULL);
     assert(ret == 0);
@@ -406,7 +405,7 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
 {
     struct fi_cntr_attr attr = {0};
     int ret = fi_mr_reg(ctx.domain, request->data_buffer, request->size, FI_WRITE | FI_REMOTE_WRITE,
-                        0, 0, 0, &request->data_buffer_mr, NULL);
+                        FI_RMA_EVENT, request->store_index + DEFAULT_REQUEST_STORE_SIZE, 0, &request->data_buffer_mr, NULL);
     assert(ret == 0);
     if (ret < 0) {
         OPT_PERSISTENT_ERR("Data MR alloc failed");
@@ -432,7 +431,7 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
 	
 
     ret = fi_mr_reg(ctx.domain, &request->flag_buffer, sizeof(int), FI_WRITE | FI_REMOTE_WRITE, 0,
-                    0, 0, &request->flag_buffer_mr, NULL);
+                    request->store_index, 0, &request->flag_buffer_mr, NULL);
     assert(ret == 0);
     if (ret < 0) {
         OPT_PERSISTENT_ERR("Flag MR alloc failed");
@@ -575,7 +574,7 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request)
     if (request->size <= ctx.inject_size) {
         flags = FI_INJECT;
     } else {
-        flags = FI_COMPLETION | FI_INJECT_COMPLETE;
+        flags = FI_COMPLETION | FI_DELIVERY_COMPLETE;
         request->posted_ops++;
     }
 
@@ -657,7 +656,7 @@ static inline int mpiext_persistent_finalize_recv_core(persistent_request_t *req
 {
     int ret = fi_cntr_wait(request->data_access_cntr,request->posted_ops,-1);
     if(ret < 0)
-	OPT_PERSISTENT_ERR("fi_cntr_wait failed\n");
+        OPT_PERSISTENT_ERR("fi_cntr_wait failed\n");
     OPT_PERSISTENT_INFO("Finalized Recv operation");
     return PRISM_SUCCESS;
 }
