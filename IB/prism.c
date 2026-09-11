@@ -696,7 +696,7 @@ mpiext_persistent_finialize_init_first(persistent_request_t *request) {
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_send_core(request);
 	} else {
-		printf("ready recv operation on %i\n",
+		OPT_PERSISTENT_INFO("ready recv operation on %i\n",
 				    ctx.my_world_rank);
 		return mpiext_persistent_start_recv_core(request);
 	}
