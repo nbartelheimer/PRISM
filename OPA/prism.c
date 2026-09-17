@@ -539,14 +539,11 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request) {
 	    .data = request->remote_store_index,
 	};
 
-	flags = FI_REMOTE_CQ_DATA;
-
-	if (request->size <= ctx.fi->tx_attr->inject_size) {
-		flags |= FI_INJECT;
-	} else {
-		flags |= FI_COMPLETION | FI_INJECT_COMPLETE;
-		request->posted_ops++;
-	}
+	/* OPX uses a rendezvous for FI_REMOTE_CQ_DATA, even for small writes,
+	 * and produces a local CQ entry. Request and track that completion for
+	 * every size, keeping the source buffer valid until PRISM_Wait returns.
+	 */
+	flags = FI_REMOTE_CQ_DATA | FI_COMPLETION | FI_INJECT_COMPLETE;
 
 	do {
 		ret = fi_writemsg(ctx.ep, &rma_msg, flags);
@@ -559,6 +556,7 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request) {
 		}
 	} while (ret);
 
+	request->posted_ops++;
 	return 0;
 }
 
