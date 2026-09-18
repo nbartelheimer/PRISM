@@ -2,11 +2,14 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_tagged.h>
+#include <rdma/fi_cxi_ext.h>
 
 #define PRISM_ERROR -1
 #define PRISM_SUCCESS 0
@@ -35,6 +38,14 @@
 
 #define MPIEXT_PERSISTENT_DEFAULT_COMP 64
 #define DEFAULT_REQUEST_STORE_SIZE UINT32_C(512)
+
+/* CXI 2.3 client keys 0..99 select optimized MRs. One remotely accessible
+ * MR is needed per request: receive data or the sender's ready flag.
+ * Allocate the lowest free key so request-store rotation does not push
+ * subsequent activations out of the optimized range. Keys >=100 provide
+ * the standard-MR fallback when more than 100 requests coexist.
+ */
+static bool remote_mr_keys[DEFAULT_REQUEST_STORE_SIZE];
 
 typedef enum mpiext_persistent_request_init_state {
 	CHECK_FOR_REMOTE_INFO = 1,
@@ -89,6 +100,7 @@ typedef struct persistent_request {
 	int tag;
 	int peer_rank;
 	int store_index;
+	int local_mr_key;
 	MPI_Comm req_comm;
 	mpiext_persistent_request_init_state_t init_state;
 	mpiext_persistent_op_type_t op_type;
@@ -107,19 +119,51 @@ static request_element_t *free_requests_head = NULL;
 static request_element_t *free_requests_tail = NULL;
 static request_element_t *request_element_mpool = NULL;
 
+static int mpiext_persistent_alloc_mr_key(void)
+{
+    /* Like other domain operations, serialized by the caller (FI_THREAD_DOMAIN). */
+    for (uint32_t key = 0; key < DEFAULT_REQUEST_STORE_SIZE; ++key) {
+        if (!remote_mr_keys[key]) {
+            remote_mr_keys[key] = true;
+            return (int)key;
+        }
+    }
+    return -FI_ENOKEY;
+}
+
 PERSISTENT_ALWAYS_INLINE static inline void
 mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
 	int ret = 0;
-	ret = fi_close(&req->data_buffer_mr->fid);
-	if(ret < 0)
-		OPT_PERSISTENT_ERR("data buffer close failed");
-	ret = fi_close(&req->flag_buffer_mr->fid);
-	if(ret < 0)
-		OPT_PERSISTENT_ERR("flag buffer close failed");
-        ret = fi_close(&req->data_access_cntr->fid);
-	if(ret < 0)
-		OPT_PERSISTENT_ERR("data cntr close failed");
+	bool remote_mr_closed = true;
+	if (req->data_buffer_mr) {
+		ret = fi_close(&req->data_buffer_mr->fid);
+		if (ret < 0) {
+			OPT_PERSISTENT_ERR("data buffer close failed");
+			if (req->op_type == PERSISTENT_RECV)
+				remote_mr_closed = false;
+		}
+	}
+	if (req->flag_buffer_mr) {
+		ret = fi_close(&req->flag_buffer_mr->fid);
+		if (ret < 0) {
+			OPT_PERSISTENT_ERR("flag buffer close failed");
+			if (req->op_type == PERSISTENT_SEND)
+				remote_mr_closed = false;
+		}
+	}
+	if (req->data_access_cntr) {
+		ret = fi_close(&req->data_access_cntr->fid);
+		if (ret < 0) {
+			OPT_PERSISTENT_ERR("data cntr close failed");
+		}
+	}
+	/* Never recycle a key if its remote MR could not be closed. */
+	if (req->local_mr_key >= 0 && remote_mr_closed) {
+		remote_mr_keys[req->local_mr_key] = false;
+		req->local_mr_key = -1;
+	}
 	free(req->my_rdma_info_buffer);
+	req->my_rdma_info_buffer = NULL;
 
 	req->data_access_cntr = NULL;
 	req->data_buffer_mr = NULL;
@@ -251,7 +295,7 @@ static inline void put_persistent_request(int index) {
 static void mpiext_persistent_print_provider_info(struct fi_info *info)
 {
     if (NULL != info) {
-        fprintf(stderr, "Provider info:\n");
+        fprintf(stderr, "PRISM rank %d provider info:\n", ctx.my_world_rank);
         fprintf(stderr, "   %s (%s)\n", info->fabric_attr->prov_name, info->domain_attr->name);
 
         fprintf(stderr, "  capabilities: %s\n", fi_tostr(&info->caps, FI_TYPE_CAPS));
@@ -274,6 +318,11 @@ static void mpiext_persistent_print_provider_info(struct fi_info *info)
         fprintf(stderr, "Tx attributes:\n");
         fprintf(stderr, "  tx iov_limit: %ld\n", tx_attr->iov_limit);
         fprintf(stderr, "  tx rma_iov_limit: %ld\n", tx_attr->rma_iov_limit);
+        fprintf(stderr, "  tx size: %zu\n", tx_attr->size);
+        fprintf(stderr, "  tx ordering: %s\n",
+                fi_tostr(&tx_attr->msg_order, FI_TYPE_MSG_ORDER));
+        fprintf(stderr, "  tx default flags: %s\n",
+                fi_tostr(&tx_attr->op_flags, FI_TYPE_OP_FLAGS));
     }
 }
 
@@ -289,6 +338,7 @@ static inline void mpiext_persistent_reset_request(
 	request->data_access_cntr = NULL;
 	request->data_buffer_mr = NULL;
 	request->flag_buffer_mr = NULL;
+	request->local_mr_key = -1;
 	request->size = 0;
 	request->my_rdma_info_size = 0;
 	request->data_buffer = NULL;
@@ -310,8 +360,9 @@ int PRISM_Init(void)
     char addr[64];
     uint64_t addr_len = 64;
     int my_rank, world_size;
-    struct fi_info *rma_info;
-    struct fi_info *tagged_info;
+    struct fi_info *rma_info = NULL;
+    struct fi_cxi_dom_ops *cxi_ops = NULL;
+    const char *domain_name = getenv("PRISM_CXI_DOMAIN");
     
     PMPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     PMPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -320,7 +371,17 @@ int PRISM_Init(void)
     ctx.n_peers = world_size;
 
     hints = fi_allocinfo();
-    assert(hints != NULL);
+    if (!hints)
+        return -FI_ENOMEM;
+
+    hints->fabric_attr->prov_name = strdup("cxi");
+    if (domain_name && domain_name[0])
+        hints->domain_attr->name = strdup(domain_name);
+    if (!hints->fabric_attr->prov_name ||
+        (domain_name && domain_name[0] && !hints->domain_attr->name)) {
+        fi_freeinfo(hints);
+        return -FI_ENOMEM;
+    }
 
     hints->ep_attr->type = FI_EP_RDM;
     hints->caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_RMA_EVENT;
@@ -331,21 +392,38 @@ int PRISM_Init(void)
     hints->addr_format = FI_FORMAT_UNSPEC;
 
     ret = fi_getinfo(FI_VERSION(2, 3), NULL, NULL, 0, hints, &rma_info);
-    assert(ret == 0);
-
     fi_freeinfo(hints);
-
-//#ifdef DEBUG
-    if (my_rank == 0) {
-        mpiext_persistent_print_provider_info(rma_info);
+    if (ret) {
+        OPT_PERSISTENT_ERR("CXI lookup for domain %s failed: %s",
+                           domain_name && domain_name[0] ? domain_name : "(provider default)",
+                           fi_strerror(-ret));
+        return ret;
     }
-//#endif
+
+    mpiext_persistent_print_provider_info(rma_info);
 
     ret = fi_fabric(rma_info->fabric_attr, &ctx.fabric, NULL);
-    assert(ret == 0);
+    if (ret)
+        goto err_cxi_setup;
 
     ret = fi_domain(ctx.fabric, rma_info, &ctx.domain, NULL);
-    assert(ret == 0);
+    if (ret)
+        goto err_cxi_setup;
+
+    /* CXI otherwise ignores fi_mr_desc() and maps every non-injected write
+     * internally. Enable this before creating any endpoints.
+     */
+    ret = fi_open_ops(&ctx.domain->fid, FI_CXI_DOM_OPS_3, 0,
+                      (void **)&cxi_ops, NULL);
+    if (ret)
+        goto err_cxi_setup;
+    if (!cxi_ops || !cxi_ops->enable_hybrid_mr_desc) {
+        ret = -FI_ENOSYS;
+        goto err_cxi_setup;
+    }
+    ret = cxi_ops->enable_hybrid_mr_desc(&ctx.domain->fid, true);
+    if (ret)
+        goto err_cxi_setup;
 
     cq_attr.format = FI_CQ_FORMAT_CONTEXT;
     cq_attr.wait_obj = FI_WAIT_NONE;
@@ -395,54 +473,87 @@ int PRISM_Init(void)
     }
    
     ctx.inject_size = rma_info->tx_attr->inject_size;
+    fi_freeinfo(rma_info);
 
     init_request_storage();
     OPT_PERSISTENT_INFO("Done initializing PRISM");
     return PRISM_SUCCESS;
+
+err_cxi_setup:
+    OPT_PERSISTENT_ERR("CXI domain/hybrid descriptor setup failed: %s", fi_strerror(-ret));
+    if (ctx.domain) {
+        fi_close(&ctx.domain->fid);
+        ctx.domain = NULL;
+    }
+    if (ctx.fabric) {
+        fi_close(&ctx.fabric->fid);
+        ctx.fabric = NULL;
+    }
+    fi_freeinfo(rma_info);
+    return ret;
 }
 
 static inline int mpiext_persistent_register_memory(persistent_request_t *request)
 {
     struct fi_cntr_attr attr = {0};
-    int ret = fi_mr_reg(ctx.domain, request->data_buffer, request->size, FI_WRITE | FI_REMOTE_WRITE,
-                        FI_RMA_EVENT, request->store_index + DEFAULT_REQUEST_STORE_SIZE, 0, &request->data_buffer_mr, NULL);
-    assert(ret == 0);
-    if (ret < 0) {
-        OPT_PERSISTENT_ERR("Data MR alloc failed");
-        return ret;
-    }
+    const bool receiving = request->op_type == PERSISTENT_RECV;
+    int ret;
 
-    attr.events = FI_CNTR_EVENTS_COMP;
-    attr.wait_obj = FI_WAIT_UNSPEC;
+    request->local_mr_key = mpiext_persistent_alloc_mr_key();
+    if (request->local_mr_key < 0)
+        return request->local_mr_key;
+
+    /* Receive data is a remote-write target with a completion counter.
+     * Send data needs only a local descriptor for outgoing RMA writes.
+     * FI_RMA_EVENT belongs in flags, not the reserved offset argument.
+     */
+    ret = fi_mr_reg(ctx.domain, request->data_buffer, request->size,
+                    receiving ? FI_REMOTE_WRITE : FI_WRITE,
+                    0, receiving ? (uint64_t)request->local_mr_key : 0,
+                    receiving ? FI_RMA_EVENT : 0,
+                    &request->data_buffer_mr, NULL);
+    if (ret)
+        goto err_register;
 
     ret = fi_mr_bind(request->data_buffer_mr, &ctx.ep->fid, 0ULL);
-    assert(ret == 0);
+    if (ret)
+        goto err_register;
 
-    ret = fi_cntr_open(ctx.domain, &attr,&request->data_access_cntr,NULL);
-    if(ret < 0){
-	OPT_PERSISTENT_ERR("cntr open failed with %i %s",ret, fi_strerror(-ret));
+    if (receiving) {
+        attr.events = FI_CNTR_EVENTS_COMP;
+        attr.wait_obj = FI_WAIT_UNSPEC;
+
+        ret = fi_cntr_open(ctx.domain, &attr, &request->data_access_cntr, NULL);
+        if (ret)
+            goto err_register;
+
+        ret = fi_mr_bind(request->data_buffer_mr, &request->data_access_cntr->fid,
+                         FI_REMOTE_WRITE);
+        if (ret)
+            goto err_register;
     }
-
-    ret = fi_mr_bind(request->data_buffer_mr, &request->data_access_cntr->fid, FI_REMOTE_WRITE);
-    assert(ret == 0);
 
     ret = fi_mr_enable(request->data_buffer_mr);
-    assert(ret == 0);
-	
+    if (ret)
+        goto err_register;
 
-    ret = fi_mr_reg(ctx.domain, &request->flag_buffer, sizeof(int), FI_WRITE | FI_REMOTE_WRITE, 0,
-                    request->store_index, 0, &request->flag_buffer_mr, NULL);
-    assert(ret == 0);
-    if (ret < 0) {
-        OPT_PERSISTENT_ERR("Flag MR alloc failed");
-        return ret;
-    }
+    /* Only the sender's flag is remotely written. Keeping the receiver's
+     * flag local avoids spending a second optimized key per receive.
+     */
+    ret = fi_mr_reg(ctx.domain, &request->flag_buffer, sizeof(int),
+                    receiving ? FI_WRITE : FI_REMOTE_WRITE,
+                    0, receiving ? 0 : (uint64_t)request->local_mr_key,
+                    0, &request->flag_buffer_mr, NULL);
+    if (ret)
+        goto err_register;
 
     ret = fi_mr_bind(request->flag_buffer_mr, &ctx.ep->fid, 0ULL);
-    assert(ret == 0);
+    if (ret)
+        goto err_register;
 
     ret = fi_mr_enable(request->flag_buffer_mr);
-    assert(ret == 0);
+    if (ret)
+        goto err_register;
 
     OPT_PERSISTENT_INFO("[setup] DATA MR key (local)    : 0x%lx",
                         fi_mr_key(request->data_buffer_mr));
@@ -451,6 +562,11 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
                         fi_mr_key(request->flag_buffer_mr));
     OPT_PERSISTENT_INFO("[setup] FLAG MR vaddr          : %p", (void *) &request->flag_buffer);
     return PRISM_SUCCESS;
+
+err_register:
+    OPT_PERSISTENT_ERR("Request MR setup failed: %s", fi_strerror(-ret));
+    mpiext_persistent_cleanup_request_ressources(request);
+    return ret;
 }
 
 PERSISTENT_ALWAYS_INLINE static inline void
@@ -458,9 +574,11 @@ mpiext_persistent_pack_rdma_info(persistent_request_t *request)
 {
     uint64_t *packed = request->my_rdma_info_buffer;
     packed[0] = (uint64_t) request->data_buffer;
-    packed[1] = fi_mr_key(request->data_buffer_mr);
+    packed[1] = request->op_type == PERSISTENT_RECV ?
+                fi_mr_key(request->data_buffer_mr) : 0;
     packed[2] = (uint64_t) &request->flag_buffer;
-    packed[3] = fi_mr_key(request->flag_buffer_mr);
+    packed[3] = request->op_type == PERSISTENT_SEND ?
+                fi_mr_key(request->flag_buffer_mr) : 0;
     packed[4] = (uint64_t)request->store_index;
 }
 
@@ -498,8 +616,9 @@ int PRISM_Finalize(void)
 
 static int mpiext_persistent_init_request(persistent_request_t *request)
 {
-    int ret = 0;
-    mpiext_persistent_register_memory(request);
+    int ret = mpiext_persistent_register_memory(request);
+    if (ret)
+        return ret;
     request->my_rdma_info_size = 5 * sizeof(uint64_t);
 
     request->my_rdma_info_buffer = malloc(request->my_rdma_info_size);
@@ -574,7 +693,10 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request)
     if (request->size <= ctx.inject_size) {
         flags = FI_INJECT;
     } else {
-        flags = FI_COMPLETION | FI_DELIVERY_COMPLETE;
+        /* CXI's default transmit completion permits source-buffer reuse.
+         * Receiver visibility is established by its remote-write counter.
+         */
+        flags = FI_COMPLETION;
         request->posted_ops++;
     }
 
