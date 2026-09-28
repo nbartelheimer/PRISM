@@ -129,7 +129,7 @@ static inline int init_request_storage(void) {
 	request_element_t *elem = NULL;
 
 	request_store =
-	    malloc(DEFAULT_REQUEST_STORE_SIZE * sizeof(persistent_request_t));
+	    calloc(DEFAULT_REQUEST_STORE_SIZE, sizeof(persistent_request_t));
 	if (!request_store) {
 		OPT_PERSISTENT_ERR("request_store alloc failed");
 		return -1;
@@ -152,6 +152,8 @@ static inline int init_request_storage(void) {
 
 		free_requests_append(elem);
 	}
+
+	return PRISM_SUCCESS;
 }
 
 static inline void cleanup_request_storage(void) {
@@ -176,8 +178,8 @@ static inline void cleanup_request_storage(void) {
 
 	request_element_mpool = NULL;
 
-	for (uint32_t i = 0; i < DEFAULT_REQUEST_STORE_SIZE; ++i) {
-		if (request_store[i].req_state == REQ_FREE) continue;
+	for (uint32_t i = 0; request_store && i < DEFAULT_REQUEST_STORE_SIZE; ++i) {
+		if (request_store[i].req_state != REQ_ACTIVE) continue;
 
 		mpiext_persistent_cleanup_request_ressources(&request_store[i]);
 	}
@@ -289,6 +291,8 @@ static inline void mpiext_persistent_reset_request(
 	request->op_type = OP_INVALID;
 }
 
+static void mpiext_persistent_cleanup_module(void);
+
 int PRISM_Init(void) {
 	int ret;
 	struct fi_info *hints = NULL;
@@ -297,12 +301,13 @@ int PRISM_Init(void) {
 	char addr[64];
 	uint64_t addr_len = 64;
 	int my_rank, world_size;
+	char *tmp_addr_buffer = NULL;
 
 	PMPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 	PMPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
 	hints = fi_allocinfo();
-	assert(hints != NULL);
+	if (!hints) return -FI_ENOMEM;
 
 	hints->ep_attr->type = FI_EP_RDM;
 	hints->caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE;
@@ -316,8 +321,14 @@ int PRISM_Init(void) {
 	hints->addr_format = FI_FORMAT_UNSPEC;
 
 	ret = fi_getinfo(FI_VERSION(2, 6), NULL, NULL, 0, hints, &ctx.fi);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_getinfo failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
+
 	fi_freeinfo(hints);
+	hints = NULL;
 
 #ifdef DEBUG
 	if (my_rank == 0) {
@@ -326,16 +337,28 @@ int PRISM_Init(void) {
 #endif
 
 	ret = fi_fabric(ctx.fi->fabric_attr, &ctx.fabric, NULL);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_fabric failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	ret = fi_domain(ctx.fabric, ctx.fi, &ctx.domain, NULL);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_domain failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	cq_attr.format = FI_CQ_FORMAT_DATA;
 	cq_attr.wait_obj = FI_WAIT_NONE;
 
 	ret = fi_cq_open(ctx.domain, &cq_attr, &ctx.cq, NULL);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_cq_open failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	av_attr.type = FI_AV_TABLE;
 	av_attr.count = world_size;
@@ -343,34 +366,67 @@ int PRISM_Init(void) {
 	ctx.n_peers = world_size;
 
 	ret = fi_av_open(ctx.domain, &av_attr, &ctx.av, NULL);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_av_open failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	ret = fi_endpoint(ctx.domain, ctx.fi, &ctx.ep, NULL);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_endpoint failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
+
 	ret = fi_ep_bind(ctx.ep, &ctx.cq->fid,
 			 FI_TRANSMIT | FI_SELECTIVE_COMPLETION | FI_RECV);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_ep_bind failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	ret = fi_ep_bind(ctx.ep, &ctx.av->fid, 0);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_ep_bind failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
+
+	OPT_PERSISTENT_INFO("AV BIND");
 
 	/* Enable the endpoint: from this point data-path calls are valid. */
 	ret = fi_enable(ctx.ep);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_enable failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	/* Publish our ep address */
 
 	ret = fi_getname(&ctx.ep->fid, &addr[0], &addr_len);
-	assert(ret == 0);
+	if (ret != 0) {
+		OPT_PERSISTENT_ERR("fi_getname failed: %s (%d)",
+				   fi_strerror(-ret), ret);
+		goto fail;
+	}
 
 	OPT_PERSISTENT_INFO("My ep addr: %lu", (uint64_t)addr);
 	OPT_PERSISTENT_INFO("My ep addr_len: %lu", addr_len);
 
 	ctx.peer_addr = calloc(ctx.n_peers, sizeof(fi_addr_t));
-	assert(ctx.peer_addr != NULL);
+	if (!ctx.peer_addr) {
+		ret = -FI_ENOMEM;
+		goto fail;
+	}
 
-	char *tmp_addr_buffer = malloc(world_size * addr_len);
-	char *tmp_msg_addr_buffer = malloc(world_size * addr_len);
+	tmp_addr_buffer = malloc(world_size * addr_len);
+	if (!tmp_addr_buffer) {
+		ret = -FI_ENOMEM;
+		goto fail;
+	}
 
 	PMPI_Allgather(addr, addr_len, MPI_BYTE, tmp_addr_buffer, addr_len,
 		       MPI_BYTE, MPI_COMM_WORLD);
@@ -379,15 +435,28 @@ int PRISM_Init(void) {
 		if (i == my_rank) continue;
 		ret = fi_av_insert(ctx.av, tmp_addr_buffer + i * addr_len, 1,
 				   &ctx.peer_addr[i], 0, NULL);
-		if (ret < 0) {
-			OPT_PERSISTENT_ERR("fi_av_insert failed");
+		if (ret != 1) {
+			OPT_PERSISTENT_ERR("fi_av_insert failed: %d", ret);
+			if (ret >= 0) ret = -FI_EIO;
+			goto fail;
 		}
 	}
 
 	ctx.my_world_rank = my_rank;
-	init_request_storage();
+	ret = init_request_storage();
+	if (ret != 0) {
+		cleanup_request_storage();
+		goto fail;
+	}
 
+	free(tmp_addr_buffer);
 	return PRISM_SUCCESS;
+
+fail:
+	if (hints) fi_freeinfo(hints);
+	free(tmp_addr_buffer);
+	mpiext_persistent_cleanup_module();
+	return ret;
 }
 
 static inline int mpiext_persistent_register_memory(
@@ -439,12 +508,14 @@ PERSISTENT_ALWAYS_INLINE static inline void mpiext_persistent_unpack_rdma_info(
 }
 
 static void mpiext_persistent_cleanup_module(void) {
+	if (ctx.ep) fi_close(&ctx.ep->fid);
 	if (ctx.av) fi_close(&ctx.av->fid);
 	if (ctx.cq) fi_close(&ctx.cq->fid);
-	if (ctx.ep) fi_close(&ctx.ep->fid);
 	if (ctx.domain) fi_close(&ctx.domain->fid);
 	if (ctx.fabric) fi_close(&ctx.fabric->fid);
 	if (ctx.fi) fi_freeinfo(ctx.fi);
+	free(ctx.peer_addr);
+	ctx = (mpiext_persistent_ctx_t){0};
 }
 
 int PRISM_Finalize(void) {
