@@ -44,7 +44,7 @@ static size_t persistent_eager_max = PERSISTENT_EAGER_MAX;
 /* Setup remains on the application's MPI channel. All peers must use this
  * wire format; the marker also rejects old, direction-less setup records. */
 #define PERSISTENT_SETUP_WORDS 11
-#define PERSISTENT_SETUP_MAGIC UINT64_C(0x5052534358490003)
+#define PERSISTENT_SETUP_MAGIC UINT64_C(0x5052534358490004)
 
 /* Each buffered receiver owns two independently counted target MRs. */
 #define PERSISTENT_MR_KEYS (2 * DEFAULT_REQUEST_STORE_SIZE)
@@ -99,6 +99,7 @@ typedef struct mpiext_persistent_ctx {
 	bool triggered;
 	size_t trigger_capacity;
 	size_t trigger_requests;
+	struct persistent_request *pending_triggers;
 	fi_addr_t *peer_addr;
 	int n_peers;
 	int my_world_rank;
@@ -121,6 +122,7 @@ typedef struct persistent_request {
 	uint32_t local_mr_key[2];
 	bool active;
 	bool trigger_pending;
+	struct persistent_request *next_trigger;
 	/* Keep deferred-work descriptors alive until completion. */
 	struct iovec trigger_iov;
 	struct fi_rma_iov trigger_rma_iov;
@@ -132,7 +134,7 @@ typedef struct persistent_request {
 	struct fid_mr *flag_buffer_mr;
 	void *data_buffer;
 	void *my_rdma_info_buffer;
-	int flag_buffer;
+	volatile uint64_t flag_buffer;
 	int tag;
 	int peer_rank;
 	int store_index;
@@ -527,12 +529,17 @@ int PRISM_Init(void) {
 	hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
 	hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
 	hints->tx_attr->op_flags = 0;
-	hints->tx_attr->msg_order = 0;
+	/* Credits overwrite one polled word: preserve their write order. */
+	hints->tx_attr->msg_order = FI_ORDER_RMA_WAW;
 	hints->addr_format = FI_FORMAT_UNSPEC;
 
 	ret = fi_getinfo(FI_VERSION(2, 6), NULL, NULL, 0, hints, &ctx.fi);
 	if (ret) {
 		OPT_PERSISTENT_ERR("CXI initialization failed: %s", fi_strerror(-ret));
+		goto local_setup_done;
+	}
+	if (ctx.fi->tx_attr->inject_size < sizeof(uint64_t)) {
+		ret = -FI_ENOSYS;
 		goto local_setup_done;
 	}
 	fi_freeinfo(hints);
@@ -716,6 +723,10 @@ static inline int mpiext_persistent_register_memory(
 		ret = fi_cntr_open(ctx.domain, &attr, &request->trigger_cntr, NULL);
 		if (ret) return MPI_ERR_OTHER;
 		ctx.trigger_requests++;
+		/* Software advances this counter after polling RTR. It is never
+		 * associated with the flag MR. */
+		ret = fi_cntr_open(ctx.domain, &attr, &request->target_cntr, NULL);
+		if (ret) goto fail;
 	}
 	for (unsigned slot = 0; slot < targets; ++slot) {
 		struct fid_cntr **cntr = slot ? &request->second_cntr : &request->target_cntr;
@@ -729,15 +740,20 @@ static inline int mpiext_persistent_register_memory(
 		if (key == PERSISTENT_MR_KEYS) return MPI_ERR_NO_MEM;
 		remote_mr_keys[key] = true;
 		request->local_mr_key[slot] = key;
-		ret = fi_cntr_open(ctx.domain, &attr, cntr, NULL);
-		if (ret) goto fail;
+		bool counted = request->op_type == PERSISTENT_RECV;
+		if (counted) {
+			ret = fi_cntr_open(ctx.domain, &attr, cntr, NULL);
+			if (ret) goto fail;
+		}
 		ret = fi_mr_reg(ctx.domain, buffer, length, FI_REMOTE_WRITE, 0, key,
-		                FI_RMA_EVENT, mr, NULL);
+		                counted ? FI_RMA_EVENT : 0, mr, NULL);
 		if (ret) goto fail;
 		ret = fi_mr_bind(*mr, &ctx.ep->fid, 0);
 		if (ret) goto fail;
-		ret = fi_mr_bind(*mr, &(*cntr)->fid, FI_REMOTE_WRITE);
-		if (ret) goto fail;
+		if (counted) {
+			ret = fi_mr_bind(*mr, &(*cntr)->fid, FI_REMOTE_WRITE);
+			if (ret) goto fail;
+		}
 		ret = fi_mr_enable(*mr);
 		if (ret) goto fail;
 	}
@@ -866,7 +882,7 @@ static inline int mpiext_persistent_request_error(
 }
 
 /* CQ access only drives CXI's manual progress and reports asynchronous errors.
- * Protocol readiness and completion are determined exclusively by counters. */
+ * Readiness is polled from flags; data completion uses counters. */
 PERSISTENT_ALWAYS_INLINE static inline int mpiext_persistent_progress(void) {
 	if (ctx.error != PRISM_SUCCESS) return ctx.error;
 	struct fi_cq_entry unexpected;
@@ -883,6 +899,24 @@ PERSISTENT_ALWAYS_INLINE static inline int mpiext_persistent_progress(void) {
 	if (fi_cntr_readerr(ctx.tx_cntr)) {
 		OPT_PERSISTENT_ERR("CXI transmit counter failure");
 		return ctx.error = MPI_ERR_OTHER;
+	}
+	/* Service every queued sender, including when the caller waits for a
+	 * receive or a different send. RTR flag MRs have no bound counter. */
+	persistent_request_t **link = &ctx.pending_triggers;
+	while (*link) {
+		persistent_request_t *request = *link;
+		if (request->flag_buffer < request->expected_rtr) {
+			link = &request->next_trigger;
+			continue;
+		}
+		int rc = fi_cntr_set(request->target_cntr, request->expected_rtr);
+		if (rc == -FI_EAGAIN) {
+			link = &request->next_trigger;
+			continue;
+		}
+		if (rc) return ctx.error = request->error = MPI_ERR_OTHER;
+		*link = request->next_trigger;
+		request->next_trigger = NULL;
 	}
 	return PRISM_SUCCESS;
 }
@@ -938,6 +972,8 @@ static int mpiext_persistent_start_triggered_transfer(persistent_request_t *requ
 	request->expected_rtr++;
 	request->triggered_posted++;
 	request->trigger_pending = true;
+	request->next_trigger = ctx.pending_triggers;
+	ctx.pending_triggers = request;
 	return PRISM_SUCCESS;
 }
 
@@ -978,12 +1014,23 @@ PERSISTENT_ALWAYS_INLINE static inline int
 mpiext_persistent_start_flag_transfer(persistent_request_t *request) {
 	if (ctx.tx_posted == FI_CXI_CNTR_SUCCESS_MAX)
 		return ctx.error = MPI_ERR_OTHER;
-	/* A zero-byte write increments the peer MR counter once. There is no
-	 * remotely polled flag, payload, immediate value, or success CQ event. */
+	if (request->flag_buffer == FI_CXI_CNTR_SUCCESS_MAX)
+		return request->error = MPI_ERR_OTHER;
+	/* Inject a monotonically increasing RTR/credit sequence. Injection
+	 * copies the source before return; the target is polled without reset. */
+	uint64_t value = request->flag_buffer + 1;
+	struct iovec iov = {&value, sizeof(value)};
+	struct fi_rma_iov remote = {
+		.addr = request->remote_flag_addr, .len = sizeof(value),
+		.key = request->remote_flag_mkey,
+	};
+	struct fi_msg_rma msg = {
+		.msg_iov = &iov, .iov_count = 1, .addr = request->peer_addr,
+		.rma_iov = &remote, .rma_iov_count = 1, .context = request,
+	};
 	ssize_t ret;
 	do {
-		ret = fi_write(ctx.ep, NULL, 0, NULL, request->peer_addr,
-		               request->remote_flag_addr, request->remote_flag_mkey, request);
+		ret = fi_writemsg(ctx.ep, &msg, FI_INJECT);
 		if (ret == -FI_EAGAIN) {
 			int progress = mpiext_persistent_progress_request(request);
 			if (progress != PRISM_SUCCESS) return progress;
@@ -993,6 +1040,7 @@ mpiext_persistent_start_flag_transfer(persistent_request_t *request) {
 		OPT_PERSISTENT_ERR("CXI control write failed: %s", fi_strerror(-ret));
 		return request->error = MPI_ERR_OTHER;
 	}
+	request->flag_buffer = value;
 	ctx.tx_posted++;
 	return PRISM_SUCCESS;
 }
@@ -1009,7 +1057,7 @@ static inline int mpiext_persistent_start_send_core(persistent_request_t *reques
 	do {
 		int ret = mpiext_persistent_progress_request(request);
 		if (ret != PRISM_SUCCESS) return ret;
-	} while (fi_cntr_read(request->target_cntr) < threshold);
+	} while (request->flag_buffer < threshold);
 	request->expected_rtr = threshold;
 	return mpiext_persistent_start_data_transfer(request);
 }
@@ -1248,6 +1296,9 @@ int PRISM_Psend_init(const void *buffer, int count, MPI_Datatype datatype,
 
 	if (request == NULL) return MPI_ERR_ARG;
 	*request = NULL;
+	if (!ctx.fi || !ctx.domain || !ctx.ep || !request_store) {
+		return MPI_ERR_OTHER;
+	}
 	int ret = mpiext_persistent_message_size(count, datatype, &bytes);
 	if (ret != MPI_SUCCESS) return ret;
 	/* Choose before registering memory or advertising the receive target.
@@ -1287,6 +1338,9 @@ int PRISM_Precv_init(void *buffer, int count, MPI_Datatype datatype, int src,
 
 	if (request == NULL) return MPI_ERR_ARG;
 	*request = NULL;
+	if (!ctx.fi || !ctx.domain || !ctx.ep || !request_store) {
+		return MPI_ERR_OTHER;
+	}
 	int ret = mpiext_persistent_message_size(count, datatype, &bytes);
 	if (ret != MPI_SUCCESS) return ret;
 	if (mpiext_persistent_use_eager(bytes))
@@ -1333,7 +1387,7 @@ static int mpiext_persistent_start_buffered(persistent_request_t *request) {
 		do {
 			int ret = mpiext_persistent_progress_request(request);
 			if (ret != PRISM_SUCCESS) return ret;
-		} while (fi_cntr_read(request->target_cntr) < needed);
+		} while (request->flag_buffer < needed);
 		int ret = mpiext_persistent_start_data_transfer(request);
 		if (ret != PRISM_SUCCESS) return ret;
 		request->buffered_sent++;
@@ -1508,9 +1562,9 @@ int PRISM_Prequest_free(PRISM_Request *request) {
 		do {
 			int ret = mpiext_persistent_progress_request(req);
 			if (ret != PRISM_SUCCESS) return ret;
-		} while (fi_cntr_read(req->target_cntr) < req->buffered_sent);
+		} while (req->flag_buffer < req->buffered_sent);
 	}
-	/* Retire zero-byte control writes before releasing request context. */
+	/* Retire control writes before releasing request context. */
 	if (req->posted_ops || req->buffered_consumed) {
 		int ret = mpiext_persistent_finalize_send_core(req);
 		if (ret != PRISM_SUCCESS) return ret;
