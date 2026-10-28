@@ -41,14 +41,14 @@
 #define DEFAULT_REQUEST_STORE_SIZE UINT32_C(512)
 
 /* CXI 2.3 client keys 0..99 select optimized MRs. A request needs one remote
- * MR (data or ready flag), or two data MRs for a buffered receiver.
+ * MR (data or ready flag). A buffered receiver registers both slots together.
  * Allocate the lowest free key so request-store rotation does not push
  * subsequent activations out of the optimized range. Keys >=100 provide
  * the standard-MR fallback when more than 100 requests coexist.
  */
-#define PERSISTENT_MR_KEYS (2 * DEFAULT_REQUEST_STORE_SIZE)
-#define PERSISTENT_SETUP_WORDS 10
-#define PERSISTENT_SETUP_MAGIC UINT64_C(0x5052534358490005)
+#define PERSISTENT_MR_KEYS DEFAULT_REQUEST_STORE_SIZE
+#define PERSISTENT_SETUP_WORDS 9
+#define PERSISTENT_SETUP_MAGIC UINT64_C(0x5052534358490006)
 static bool remote_mr_keys[PERSISTENT_MR_KEYS];
 
 typedef enum mpiext_persistent_request_init_state {
@@ -95,13 +95,11 @@ typedef struct persistent_request {
 	uint64_t posted_ops;
 	uint64_t completed_ops;
 	uint64_t expected_flag_ops;
-	uint64_t buffered_sent, buffered_consumed, remote_second_mkey;
+	uint64_t buffered_sent, buffered_consumed;
 	volatile uint64_t credits[2];
 	void *bounce_buffer;
 	size_t remote_size;
-	struct fid_mr *second_buffer_mr;
-	struct fid_cntr *second_cntr, *trigger_cntr, *trigger_completion;
-	int second_mr_key;
+	struct fid_cntr *trigger_cntr, *trigger_completion;
 	bool buffered, active, trigger_pending, trigger_ready;
 	int error;
 	struct persistent_request *next_trigger;
@@ -157,7 +155,6 @@ PERSISTENT_ALWAYS_INLINE static inline void
 mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
 	int ret = 0;
 	bool remote_mr_closed = true;
-	bool second_closed = true;
 	if (req->data_buffer_mr) {
 		ret = fi_close(&req->data_buffer_mr->fid);
 		if (ret < 0) {
@@ -180,21 +177,12 @@ mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
 			OPT_PERSISTENT_ERR("data cntr close failed");
 		}
 	}
-	if (req->second_buffer_mr) {
-		if (fi_close(&req->second_buffer_mr->fid)) second_closed = false;
-		req->second_buffer_mr = NULL;
-	}
-	if (req->second_cntr) fi_close(&req->second_cntr->fid);
 	if (req->trigger_cntr) fi_close(&req->trigger_cntr->fid);
 	if (req->trigger_completion) {
 		fi_close(&req->trigger_completion->fid);
 	}
-	req->second_cntr = req->trigger_cntr = req->trigger_completion = NULL;
-	if (req->second_mr_key >= 0 && second_closed) {
-		remote_mr_keys[req->second_mr_key] = false;
-		req->second_mr_key = -1;
-	}
-	if (remote_mr_closed && second_closed) free(req->bounce_buffer);
+	req->trigger_cntr = req->trigger_completion = NULL;
+	if (remote_mr_closed) free(req->bounce_buffer);
 	req->bounce_buffer = NULL;
 	/* Never recycle a key if its remote MR could not be closed. */
 	if (req->local_mr_key >= 0 && remote_mr_closed) {
@@ -389,7 +377,6 @@ static inline void mpiext_persistent_reset_request(
 	memset(request, 0, sizeof(*request));
 	request->store_index = index;
 	request->req_state = state;
-	request->second_mr_key = -1;
 	request->buffered = ctx.protocol == 1;
 	request->posted_ops = 0;
 	request->completed_ops = 0;
@@ -456,6 +443,12 @@ int PRISM_Init(void)
     hints->ep_attr->type = FI_EP_RDM;
     hints->caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_RMA_EVENT;
     if (ctx.protocol == 2) hints->caps |= FI_TRIGGER;
+    if (ctx.protocol == 1) {
+        /* The shared arrival counter tracks the ordered write stream.
+         * RX ordering also keeps CXI's default MR PCIe ordering strict. */
+        hints->tx_attr->msg_order = FI_ORDER_RMA_WAW;
+        hints->rx_attr->msg_order = FI_ORDER_RMA_WAW;
+    }
     //hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
     hints->domain_attr->mr_mode = FI_MR_ALLOCATED | FI_MR_ENDPOINT;
     hints->domain_attr->threading = FI_THREAD_DOMAIN;
@@ -569,45 +562,35 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
     if (request->local_mr_key < 0)
         return request->local_mr_key;
 
-    size_t stride = request->size ? request->size : 1;
-    unsigned slots = receiving && request->buffered ? 2 : 1;
-    if (slots == 2) {
-        if (stride > SIZE_MAX / 2) { ret = -FI_EINVAL; goto err_register; }
-        if (posix_memalign(&request->bounce_buffer, 64, 2 * stride)) {
+    size_t length = request->size ? request->size : 1;
+    if (receiving && request->buffered) {
+        if (length > SIZE_MAX / 2) { ret = -FI_EINVAL; goto err_register; }
+        length *= 2;
+        if (posix_memalign(&request->bounce_buffer, 64, length)) {
             ret = -FI_ENOMEM;
             goto err_register;
         }
-        request->second_mr_key = mpiext_persistent_alloc_mr_key();
-        if (request->second_mr_key < 0) {
-            ret = request->second_mr_key;
-            goto err_register;
-        }
     }
-    for (unsigned slot = 0; slot < slots; ++slot) {
-        struct fid_mr **mr = slot ? &request->second_buffer_mr : &request->data_buffer_mr;
-        struct fid_cntr **cntr = slot ? &request->second_cntr : &request->data_access_cntr;
-        void *buffer = request->bounce_buffer ?
-            (char *)request->bounce_buffer + slot * stride : request->data_buffer;
-        uint64_t key = slot ? request->second_mr_key : request->local_mr_key;
-        ret = fi_mr_reg(ctx.domain, buffer, stride,
-                        receiving ? FI_REMOTE_WRITE : FI_WRITE,
-                        0, receiving ? key : 0, receiving ? FI_RMA_EVENT : 0,
-                        mr, NULL);
+    void *buffer = request->bounce_buffer ? request->bounce_buffer : request->data_buffer;
+    ret = fi_mr_reg(ctx.domain, buffer, length,
+                    receiving ? FI_REMOTE_WRITE : FI_WRITE,
+                    0, receiving ? (uint64_t)request->local_mr_key : 0,
+                    receiving ? FI_RMA_EVENT : 0, &request->data_buffer_mr, NULL);
+    if (ret) goto err_register;
+    ret = fi_mr_bind(request->data_buffer_mr, &ctx.ep->fid, 0);
+    if (ret) goto err_register;
+    if (receiving) {
+        attr.events = FI_CNTR_EVENTS_COMP;
+        attr.wait_obj = FI_WAIT_NONE;
+        attr.flags = FI_CXI_CNTR_CACHED;
+        ret = fi_cntr_open(ctx.domain, &attr, &request->data_access_cntr, NULL);
         if (ret) goto err_register;
-        ret = fi_mr_bind(*mr, &ctx.ep->fid, 0);
-        if (ret) goto err_register;
-        if (receiving) {
-            attr.events = FI_CNTR_EVENTS_COMP;
-            attr.wait_obj = FI_WAIT_NONE;
-            attr.flags = FI_CXI_CNTR_CACHED;
-            ret = fi_cntr_open(ctx.domain, &attr, cntr, NULL);
-            if (ret) goto err_register;
-            ret = fi_mr_bind(*mr, &(*cntr)->fid, FI_REMOTE_WRITE);
-            if (ret) goto err_register;
-        }
-        ret = fi_mr_enable(*mr);
+        ret = fi_mr_bind(request->data_buffer_mr, &request->data_access_cntr->fid,
+                         FI_REMOTE_WRITE);
         if (ret) goto err_register;
     }
+    ret = fi_mr_enable(request->data_buffer_mr);
+    if (ret) goto err_register;
     if (!receiving && ctx.protocol == 2) {
         attr.events = FI_CNTR_EVENTS_COMP;
         attr.wait_obj = FI_WAIT_NONE;
@@ -666,8 +649,7 @@ mpiext_persistent_pack_rdma_info(persistent_request_t *request)
     packed[5] = PERSISTENT_SETUP_MAGIC;
     packed[6] = ctx.protocol;
     packed[7] = request->size;
-    packed[8] = request->second_buffer_mr ? fi_mr_key(request->second_buffer_mr) : 0;
-    packed[9] = request->op_type;
+    packed[8] = request->op_type;
 }
 
 PERSISTENT_ALWAYS_INLINE static inline int
@@ -675,13 +657,12 @@ mpiext_persistent_unpack_rdma_info(persistent_request_t *request, void *payload)
 {
     uint64_t *packed = payload;
     if (packed[5] != PERSISTENT_SETUP_MAGIC || packed[6] != (uint64_t)ctx.protocol ||
-        packed[9] != (uint64_t)(request->op_type == PERSISTENT_SEND ? PERSISTENT_RECV : PERSISTENT_SEND))
+        packed[8] != (uint64_t)(request->op_type == PERSISTENT_SEND ? PERSISTENT_RECV : PERSISTENT_SEND))
         return MPI_ERR_ARG;
     request->remote_size = packed[7];
     if (request->op_type == PERSISTENT_SEND ? request->size > request->remote_size :
                                             request->remote_size > request->size)
         return MPI_ERR_TRUNCATE;
-    request->remote_second_mkey = packed[8];
     request->remote_data_addr = packed[0];
     request->remote_data_mkey = packed[1];
     request->remote_flag_addr = packed[2];
@@ -849,9 +830,10 @@ mpiext_persistent_start_data_transfer(persistent_request_t *request)
         }
     }
     struct fi_rma_iov rma_iov = {
-        .addr = 0,
+        /* The receiver's capacity, not the send length, defines its stride. */
+        .addr = request->buffered ? slot * (request->remote_size ? request->remote_size : 1) : 0,
         .len = request->size,
-        .key = request->buffered && slot ? request->remote_second_mkey : request->remote_data_mkey,
+        .key = request->remote_data_mkey,
     };
 
     struct iovec iov = {
@@ -980,15 +962,15 @@ static inline int mpiext_persistent_start_recv_core(persistent_request_t *reques
 
 PERSISTENT_ALWAYS_INLINE static inline uint64_t read_recv_completion(persistent_request_t *request)
 {
-    return fi_cntr_read(request->buffered && request->buffered_consumed % 2 ?
-                        request->second_cntr : request->data_access_cntr);
+    return fi_cntr_read(request->data_access_cntr);
 }
 
 static inline int mpiext_persistent_finalize_recv_core(persistent_request_t *request)
 {
     unsigned slot = request->buffered_consumed % 2;
-    uint64_t threshold = request->buffered ? request->buffered_consumed / 2 + 1 : request->posted_ops;
-    struct fid_cntr *cntr = request->buffered && slot ? request->second_cntr : request->data_access_cntr;
+    /* Credits already returned identify the next slot and arrival ordinal. */
+    uint64_t threshold = request->buffered ? request->buffered_consumed + 1 : request->posted_ops;
+    struct fid_cntr *cntr = request->data_access_cntr;
     while (read_recv_completion(request) < threshold) {
         if (fi_cntr_readerr(cntr)) return -FI_EIO;
         if (ctx.protocol == 2) {
