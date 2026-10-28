@@ -365,6 +365,18 @@ static void mpiext_persistent_print_provider_info(struct fi_info *info)
                 fi_tostr(&tx_attr->msg_order, FI_TYPE_MSG_ORDER));
         fprintf(stderr, "  tx default flags: %s\n",
                 fi_tostr(&tx_attr->op_flags, FI_TYPE_OP_FLAGS));
+
+        struct fi_cxi_dom_ops *ops = NULL;
+        size_t depth = 0;
+        int ret = fi_open_ops(&ctx.domain->fid, FI_CXI_DOM_OPS_4, 0,
+                              (void **)&ops, NULL);
+        if (!ret)
+            ret = ops && ops->get_dwq_depth ?
+                ops->get_dwq_depth(&ctx.domain->fid, &depth) : -FI_ENOSYS;
+        if (!ret)
+            fprintf(stderr, "  triggered operation capacity (shared CXI service/NIC): %zu\n", depth);
+        else
+            fprintf(stderr, "  triggered operation capacity: unavailable (%s)\n", fi_strerror(-ret));
     }
 }
 
@@ -459,10 +471,6 @@ int PRISM_Init(void)
         return ret;
     }
 
-#ifdef DEBUG
-    mpiext_persistent_print_provider_info(rma_info);
-#endif
-
     ret = fi_fabric(rma_info->fabric_attr, &ctx.fabric, NULL);
     if (ret)
         goto err_cxi_setup;
@@ -470,6 +478,10 @@ int PRISM_Init(void)
     ret = fi_domain(ctx.fabric, rma_info, &ctx.domain, NULL);
     if (ret)
         goto err_cxi_setup;
+
+#ifdef DEBUG
+    mpiext_persistent_print_provider_info(rma_info);
+#endif
 
     cq_attr.format = FI_CQ_FORMAT_CONTEXT;
     cq_attr.wait_obj = FI_WAIT_NONE;
