@@ -81,7 +81,6 @@ typedef struct mpiext_persistent_ctx {
 	fi_addr_t *msg_peer_addr;
 	uint64_t inject_size;
 	int protocol; /* 0: RTR (default), 1: buffered, 2: triggered */
-	size_t trigger_capacity, trigger_requests;
 	struct persistent_request *pending_triggers;
 	int error;
 	int n_peers;
@@ -189,7 +188,6 @@ mpiext_persistent_cleanup_request_ressources(persistent_request_t *req) {
 	if (req->trigger_cntr) fi_close(&req->trigger_cntr->fid);
 	if (req->trigger_completion) {
 		fi_close(&req->trigger_completion->fid);
-		ctx.trigger_requests--;
 	}
 	req->second_cntr = req->trigger_cntr = req->trigger_completion = NULL;
 	if (req->second_mr_key >= 0 && second_closed) {
@@ -497,27 +495,6 @@ int PRISM_Init(void)
     ret = fi_enable(ctx.ep);
     assert(ret == 0);
 
-    if (ctx.protocol == 2) {
-        struct fi_cxi_dom_ops *ops = NULL;
-        MPI_Comm local_comm;
-        int local_size;
-        size_t depth = 0;
-        PMPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, my_rank,
-                             MPI_INFO_NULL, &local_comm);
-        PMPI_Comm_size(local_comm, &local_size);
-        PMPI_Comm_free(&local_comm);
-        ret = fi_open_ops(&ctx.domain->fid, FI_CXI_DOM_OPS_4, 0, (void **)&ops, NULL);
-        if (!ret) ret = ops->get_dwq_depth(&ctx.domain->fid, &depth);
-        /* Reserve a conservative per-node-rank share of the service's TLEs. */
-        if (!ret && depth > 8) ctx.trigger_capacity = (depth - 8) / local_size;
-        int failed = ret || !ctx.trigger_capacity, any_failed;
-        PMPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-        if (any_failed) {
-            if (!ret) ret = -FI_ENOSPC;
-            goto err_cxi_setup;
-        }
-    }
-
     /* Publish our ep address */
 
     ret = fi_getname(&ctx.ep->fid, &addr[0], &addr_len);
@@ -620,10 +597,6 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
         if (ret) goto err_register;
     }
     if (!receiving && ctx.protocol == 2) {
-        if (ctx.trigger_requests == ctx.trigger_capacity) {
-            ret = -FI_ENOSPC;
-            goto err_register;
-        }
         attr.events = FI_CNTR_EVENTS_COMP;
         attr.wait_obj = FI_WAIT_NONE;
         attr.flags = 0;
@@ -631,7 +604,6 @@ static inline int mpiext_persistent_register_memory(persistent_request_t *reques
         if (ret) goto err_register;
         ret = fi_cntr_open(ctx.domain, &attr, &request->trigger_completion, NULL);
         if (ret) goto err_register;
-        ctx.trigger_requests++;
     }
 
     /* Only the sender's flag is remotely written. Keeping the receiver's
